@@ -1,83 +1,206 @@
-# DSP 瞄捕状态机模拟器
+# DSP 瞄捕状态机仿真项目
 
-基于 Streamlit 的 Web 界面，用于生动形象地演示 DSP 状态机（S0-S5）的状态流转过程。
+本项目用于验证 DSP 瞄捕状态机、统一设备间协议格式，并在真实硬件未到位时完成状态机逻辑测试。
 
-## 功能特性
+当前代码包含两部分：
 
-- **状态拓扑图可视化**：使用 Graphviz 绘制 S0-S6 状态机拓扑图，当前状态绿色高亮
-- **动态动作按钮**：根据当前 DSP 所处状态，动态显示可用的触发按钮
-- **系统日志**：实时记录每一次状态变更，带时间戳
-- **上行链路指示**：显示当前上行模式（毫米波/太赫兹）
-- **快速跳转**：支持手动跳转到任意状态（调试用）
-- **系统重置**：一键恢复初始状态
+- `v0` 可视化演示器：基于 Streamlit 展示 `S0-S5` 状态流转、物理架构与数据流向图、当前 slot 数据包清单和链路高亮。
+- `v1` 本机五进程仿真框架：DSP 状态机作为独立程序运行，云台、毫米波基带、THz 基带和 PC 上位机分别由独立程序提供模拟硬件行为和上位机能力。
 
-## 状态流转
+## 当前能力
 
-```
-S0 ──自检通过──→ S1 ──检测到稳定目标──→ S2 ──云台到位──→ S3 ──┬──太赫兹锁定成功──→ S4
-                                                               └──捕获超时───────→ S5
-                                                                                      │
-                                          ┌──毫米波稳定恢复──←────────────────────────┘
-                                          │
-                                          └──长时间无恢复──→ S1
-```
+- 状态机拓扑可视化：展示 `S0` 到 `S5` 的正常、异常和恢复路径。
+- 物理架构与数据流向图：按当前状态高亮参与工作的模块和链路。
+- slot 数据包清单：展示当前状态下每个 slot 涉及的数据包、字段、方向、接口和用途。
+- 数据包链路联动：选择右侧数据包后，在左侧物理架构图中高亮对应链路。
+- 手动状态切换：通过按钮或调试面板触发状态变化，用于演示和讲解。
 
-## 安装与运行
-
-### 1. 创建虚拟环境（推荐）
+当前入口：
 
 ```bash
-# 进入项目目录
 cd dsp_simulator
-
-# 创建虚拟环境
-python -m venv venv
-
-# 激活虚拟环境 (Windows)
-venv\Scripts\activate
-
-# 激活虚拟环境 (Linux/Mac)
-# source venv/bin/activate
-```
-
-### 2. 安装依赖
-
-```bash
 pip install -r requirements.txt
-```
-
-### 3. 运行应用
-
-```bash
 streamlit run app.py
 ```
 
-应用会自动在浏览器中打开，地址通常为：`http://localhost:8501`
+浏览器默认访问 `http://localhost:8501`。
 
-## 状态说明
+## 五进程架构
 
-| 状态 | 名称 | 说明 |
-|------|------|------|
-| S0 | 自检 (Self-Test) | 系统初始状态，检查各模块连通性 |
-| S1 | 搜索 (Search) | 等待毫米波感知发现目标 |
-| S2 | 粗对准 (Coarse Alignment) | DSP 控制云台转向目标 |
-| S3 | 捕获 (Acquisition) | 等待太赫兹上行链路锁定 |
-| S4 | 跟踪 (Tracking) | 监控链路质量并微调 |
-| S5 | 回退 (Fallback) | 切回毫米波模式尝试恢复 |
+`v1` 版本采用多进程仿真系统：
 
-## 界面预览
-
-模拟器主界面包含以下区域：
-1. **状态拓扑图** - 展示状态机全局视图，当前状态绿色高亮
-2. **当前状态卡片** - 显示当前所处状态、描述和上行链路模式
-3. **手动控制面板** - 根据当前状态动态显示可用的触发按钮
-4. **系统日志** - 滚动显示状态变更记录
-
-## 项目结构
-
+```text
+终端 1: dsp_state_machine.py  # DSP 状态机主程序
+终端 2: sim_gimbal.py         # 云台模拟器
+终端 3: sim_mmwave.py         # 毫米波基带模拟器
+终端 4: sim_thz.py            # THz 基带模拟器
+终端 5: pc_app.py             # PC 上位机/显示与联调工具
 ```
+
+当前主要目录：
+
+```text
 dsp_simulator/
-├── app.py              # 主应用程序
-├── requirements.txt    # Python 依赖
-└── README.md           # 说明文档
+├── app.py                  # v0 Streamlit 可视化演示器，暂时保留
+├── dsp_state_machine.py    # DSP 固定 slot 主循环
+├── sim_gimbal.py           # 云台模拟程序
+├── sim_mmwave.py           # 毫米波基带模拟程序
+├── sim_thz.py              # THz 基带模拟程序
+├── pc_app.py               # PC 上位机程序
+└── common/
+    ├── protocol.py         # 统一消息 envelope、packet_id、编解码
+    ├── packets.py          # 业务包 payload schema
+    ├── transport.py        # TCP/串口/网口传输抽象
+    ├── clock.py            # slot 时钟
+    ├── recorder.py         # 日志与包流记录
+    └── replay.py           # 历史数据回放
 ```
+
+## 模块职责边界
+
+| 模块 | 职责 | 边界 |
+|---|---|---|
+| DSP 状态机 | slot 调度、状态转移、协议收发、控制命令生成 | 不关心对端是真实硬件还是模拟器 |
+| 云台模拟器 | 模拟当前位置、目标角度、速度、到位状态和故障 | 不决定状态机是否进入捕获 |
+| 毫米波基带模拟器 | 模拟目标有效标志、角度、距离、速度、SNR、丢帧和目标消失 | 不直接控制云台 |
+| THz 基带模拟器 | 模拟 THz 启停、捕获锁定、链路质量、失锁和业务链路状态 | 不直接修改 DSP 状态 |
+| PC 上位机 | 监控、配置、日志、协议包查看、业务数据显示、告警诊断 | 真实部署时不伪造硬件反馈 |
+| 公共协议层 | 定义统一帧格式、packet_id、字段类型和传输抽象 | 不写状态机业务判断 |
+
+## 健康状态策略
+
+健康状态分三层处理，避免把“通信断开”“模块自报离线”和“功能异常”混为一个概念：
+
+| 层级 | 字段/来源 | 用途 |
+|---|---|---|
+| 心跳状态 | DSP 是否在 `health_timeout_slots` 内收到 `PKT_SYS_HEALTH` | 判断连接是否超时，超时后标记 `fault_code=heartbeat_timeout` |
+| 模块在线状态 | `PKT_SYS_HEALTH.online` | 判断模块是否可作为状态机关键依赖 |
+| 功能状态 | `fault_code`、业务包字段，如 `target_valid`、`in_position`、`lock_flag`、`link_quality` | 参与 S1-S5 业务状态转移和诊断 |
+
+关键模块为云台、毫米波基带、THz 基带。PC 是监控端，不作为 DSP 状态机自检通过的必要条件。若任一关键模块连续 `critical_offline_tolerance_slots` 个 slot 离线或心跳超时，状态机从非 S0 状态回到 `S0 自检`，避免在模块缺失时继续搜索、捕获或回退。
+
+## 状态转移矩阵
+
+DSP 状态机应只根据业务协议包和健康状态转移，不读取模拟器内部变量。下表是乘法表式状态转移矩阵：行表示当前状态，列表示目标状态，单元格填写转移条件。`-` 表示无直接转移，对角线表示保持当前状态的条件。
+
+| 当前 \ 目标 | `S0 自检` | `S1 搜索` | `S2 粗对准` | `S3 捕获` | `S4 跟踪` | `S5 回退` |
+|---|---|---|---|---|---|---|
+| `S0 自检` | 任一关键模块未在线，或时钟/同步链路未满足自检条件 | `PKT_SYS_HEALTH` 显示云台、毫米波基带、THz 基带均在线，必要时钟/同步链路正常 | - | - | - | - |
+| `S1 搜索` | - | 未检测到稳定目标，继续搜索 | 连续 `N` 个 slot 检测到稳定毫米波目标：`target_valid=true`、`snr_db >= mmwave_snr_threshold` | - | - | - |
+| `S2 粗对准` | - | 毫米波目标连续丢失超过 `coarse_target_lost_tolerance_slots`，重新搜索 | 云台尚未到位、位置误差仍大、目标仍需继续粗对准，或粗对准时间不足 `coarse_min_slots` | `PKT_MMW_DETECT.target_valid=true`，`PKT_GIMBAL_FB.in_position=true`，且 `position_error_deg <= position_error_threshold_deg` | - | - |
+| `S3 捕获` | - | - | - | THz 尚未锁定但未超时，且毫米波目标、云台到位、THz 链路质量均未超过异常容忍窗口 | `capture_slots >= capture_min_slots`，毫米波目标仍有效，云台仍到位且误差满足阈值，`PKT_THZ_STATUS.lock_flag=true`，`link_quality >= thz_quality_threshold` | THz 模块离线；毫米波目标连续丢失；云台连续偏离；THz 链路质量连续低于阈值；或捕获超时仍未锁定 |
+| `S4 跟踪` | - | - | - | - | THz 在线并保持锁定，`link_quality >= thz_quality_threshold`，毫米波辅助目标和云台微调均未超过异常容忍窗口 | THz 模块离线；连续 `thz_loss_window_slots` 个 slot 失锁；连续 `thz_loss_window_slots` 个 slot 链路质量低；毫米波辅助目标连续丢失；云台连续跟踪偏离 |
+| `S5 回退` | - | 超过 `fallback_timeout_slots` 仍未满足恢复就绪条件，重新进入搜索 | 连续 `fallback_restore_slots` 个 slot 满足恢复就绪：毫米波在线、`target_valid=true`、`snr_db >= mmwave_snr_threshold`、云台在线、THz 在线 | - | - | 回退窗口内继续使用毫米波上行，记录毫米波目标质量、毫米波通信链路、云台在线和 THz 在线状态 |
+
+第一版建议阈值：
+
+| 参数 | 建议值 | 含义 |
+|---|---:|---|
+| `N` | `3 slots` | 连续稳定目标窗口 |
+| `mmwave_snr_threshold` | `10 dB` | 毫米波目标最低可信质量 |
+| `coarse_min_slots` | `2 slots` | 进入 `S2` 后至少等待的粗对准反馈窗口 |
+| `coarse_target_lost_tolerance_slots` | `2 slots` | `S2` 中允许毫米波目标短暂丢失的 slot 数 |
+| `position_error_threshold_deg` | `0.5 deg` | 云台进入捕获前的最大角度误差 |
+| `capture_min_slots` | `2 slots` | 进入 `S3` 后至少等待的 THz 捕获反馈窗口 |
+| `capture_target_lost_tolerance_slots` | `2 slots` | `S3` 中允许毫米波目标短暂抖动/丢失的 slot 数 |
+| `capture_gimbal_error_tolerance_slots` | `2 slots` | `S3` 中允许云台短暂偏离或反馈异常的 slot 数 |
+| `thz_capture_bad_window_slots` | `3 slots` | `S3` 中 THz 链路质量连续异常后进入回退的窗口 |
+| `capture_timeout_slots` | `20 slots` | `S3` 等待 THz 锁定的最大 slot 数 |
+| `thz_loss_window_slots` | `3 slots` | `S4` 中 THz 失锁或链路质量低的连续判定窗口 |
+| `tracking_target_lost_tolerance_slots` | `3 slots` | `S4` 中允许毫米波辅助目标短暂丢失的 slot 数 |
+| `tracking_gimbal_error_tolerance_slots` | `3 slots` | `S4` 中允许云台微调短暂偏离或反馈异常的 slot 数 |
+| `thz_quality_threshold` | `0.4` | THz 链路质量回退阈值 |
+| `mmwave_link_quality_threshold` | `0.3` | S5 回退时毫米波通信链路可用性的诊断阈值 |
+| `fallback_restore_slots` | `3 slots` | S5 中恢复到 S2 前需要连续满足恢复就绪的 slot 数 |
+| `fallback_timeout_slots` | `30 slots` | S5 中等待恢复的最大 slot 数 |
+| `health_timeout_slots` | `3 slots` | 超过该窗口未收到模块健康包则判为心跳超时 |
+| `critical_offline_tolerance_slots` | `3 slots` | 非 S0 状态下关键模块连续离线后回到 S0 的窗口 |
+
+## 仿真模式与真实部署
+
+| 项目 | 仿真模式 | 真实部署模式 |
+|---|---|---|
+| 设备来源 | 四个 Python 模拟程序 | 真实云台、毫米波基带、THz 基带、PC 软件 |
+| 传输方式 | 第一版使用本机 TCP + JSON Lines | 串口、RS485、网口、光口或设备 SDK |
+| DSP 核心 | 使用同一套状态机逻辑 | 使用同一套状态机逻辑 |
+| 业务协议 | 与真实部署保持一致 | 与仿真模式保持一致 |
+| PC 功能 | 监控 + 配置 + 仿真注入 | 监控 + 配置 + 日志 + 诊断 |
+| 硬件状态调整 | 允许设置目标、故障、丢包、失锁等 | 只能来自真实硬件反馈 |
+
+关键原则：
+
+- DSP 只通过业务协议感知外部世界。
+- 仿真控制协议只用于测试，不混入真实业务协议。
+- 替换真实硬件时，应替换传输适配器和设备端实现，而不是重写 DSP 状态机。
+
+## 统一协议方向
+
+第一版业务消息建议采用 JSON Lines，每行一个消息：
+
+```json
+{
+  "version": 1,
+  "slot_id": 125,
+  "seq": 42,
+  "timestamp_ms": 1710000000000,
+  "src": "dsp",
+  "dst": "gimbal",
+  "packet_id": "PKT_GIMBAL_CMD",
+  "trigger_type": "periodic",
+  "trigger_reason": "slot_clock",
+  "payload": {}
+}
+```
+
+`trigger_type=periodic` 表示固定 slot 周期触发，`trigger_type=event` 表示 PC 注入、状态转移、故障、超时等事件触发。PC 页面和 JSONL 记录都应按该字段分组，便于区分连续时序和关键事件。
+
+业务包示例：
+
+| packet_id | 方向 | 用途 |
+|---|---|---|
+| `PKT_SYS_HEALTH` | 各模块 -> DSP | 在线、自检和健康状态 |
+| `PKT_MMW_DETECT` | 毫米波基带 -> DSP | 目标角度、距离、速度和有效标志 |
+| `PKT_MMW_RF_CTRL` | DSP -> 毫米波基带/射频 | 感知面启停、通信面启停、扫描模式、波束和增益 |
+| `PKT_MMW_LINK_STATUS` | 毫米波基带 -> DSP | 毫米波通信面质量、速率、调制阶数和可用状态 |
+| `PKT_MMW_BITSTREAM` | 毫米波基带 -> PC | 毫米波通信业务比特流、帧序号和链路质量 |
+| `PKT_GIMBAL_CMD` | DSP -> 云台 | 目标角度、速度和微调命令 |
+| `PKT_GIMBAL_FB` | 云台 -> DSP | 当前角度、速度、到位状态和误差 |
+| `PKT_THZ_PARAM` | DSP -> THz/FPGA 基带 | THz 感知面启停、通信面启停、速率、调制阶数和阈值 |
+| `PKT_THZ_STATUS` | THz 基带 -> DSP | 锁定状态、感知速度/位置/角度、链路质量和失锁计数 |
+| `PKT_THZ_BITSTREAM` | THz/FPGA 基带 -> PC | 业务比特流、帧序号和校验 |
+| `PKT_UPLINK_STATE` | DSP -> PC | 当前状态、上行模式和异常原因 |
+
+## 开发计划
+
+1. 文档阶段
+   - README 作为项目入口，说明当前能力、目标架构和开发顺序。
+   - TECHNICAL_SOLUTION 作为详细设计，说明协议分层、模块边界和测试场景。
+
+2. 公共协议阶段（已具备第一版）
+   - 抽出 `common` 层，定义状态枚举、packet_id、统一 envelope 和 payload schema。
+   - 实现 TCP + JSON Lines 传输抽象。
+   - 分离业务协议和仿真控制协议。
+   - 区分周期触发包和事件触发包，支持按触发类型查看与记录。
+
+3. 多进程仿真阶段（已具备第一版）
+   - 实现四个模拟硬件程序，支持启动、监听、收发包和打印日志。
+   - 实现 DSP 固定 slot 主循环，按输入包自动推进状态机。
+   - 实现 PC 控制台版，显示状态、包流和仿真注入命令。
+
+4. 状态机测试阶段
+   - 将 `app.py` 中按钮触发的状态转移改造为数据条件触发。
+   - 验证正常路径、捕获超时、跟踪失锁、回退恢复和设备离线。
+   - 增加场景脚本，用于复现典型流程和异常流程。
+
+5. 可视化复用阶段
+   - 复用当前 Streamlit 的物理架构图、状态拓扑和 slot 数据包清单。
+   - PC 支持仿真模式和部署模式。
+   - 部署模式隐藏仿真注入，只保留监控、配置、日志、回放和诊断。
+
+## 验收目标
+
+- 新成员能通过 README 理解当前项目、目标架构和运行方式。
+- DSP 状态机不依赖模拟器内部状态，只依赖统一业务协议包。
+- 替换真实硬件传输适配器时，不需要重写状态机核心。
+- PC 的仿真注入能力只在仿真模式启用。
+- 典型状态路径可通过模拟硬件自动触发，而不是依赖手动按钮。

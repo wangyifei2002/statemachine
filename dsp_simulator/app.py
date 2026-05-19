@@ -11,184 +11,16 @@ import streamlit as st
 import graphviz
 from datetime import datetime
 
-# ============================================================
-# 状态机配置定义
-# ============================================================
-
-STATE_NAMES = {
-    "S0": "自检", "S1": "搜索", "S2": "粗对准",
-    "S3": "捕获", "S4": "跟踪", "S5": "回退",
-}
-
-STATE_NAMES_CN = {
-    "S0": "自检 (Self-Test)", "S1": "搜索 (Search)",
-    "S2": "粗对准 (Coarse)", "S3": "捕获 (Acquisition)",
-    "S4": "跟踪 (Tracking)", "S5": "回退 (Fallback)",
-}
-
-STATE_DESCRIPTIONS = {
-    "S0": "系统初始状态，检查毫米波、太赫兹、云台和 DSP 接口连通性",
-    "S1": "等待毫米波感知发现目标，连续若干个 slot 检测到有效目标后进入下一状态",
-    "S2": "DSP 根据毫米波目标角度控制云台转向，等待云台误差收敛到阈值内",
-    "S3": "在云台粗对准前提下，等待太赫兹上行链路锁定，超时则进入回退",
-    "S4": "太赫兹链路正常工作，监控链路质量并按需微调云台",
-    "S5": "上行切回毫米波模式，依靠毫米波感知维持目标信息并尝试恢复",
-}
-
-STATE_TRANSITIONS = {
-    "S0": [("S1", "自检通过", "各模块连通性检查正常，准备进入搜索阶段")],
-    "S1": [("S2", "检测到稳定目标", "毫米波连续检测到有效目标，准备进入粗对准")],
-    "S2": [("S3", "云台到位（误差<阈值）", "云台转向完成，误差已收敛，准备进入捕获")],
-    "S3": [
-        ("S4", "太赫兹锁定成功", "太赫兹上行链路锁定成功，准备进入跟踪阶段"),
-        ("S5", "捕获超时", "太赫兹锁定超时，切换到毫米波回退模式"),
-    ],
-    "S4": [("S5", "链路质量变差/失锁", "太赫兹链路质量连续变差或失锁，进入回退状态")],
-    "S5": [
-        ("S2", "毫米波稳定恢复", "毫米波感知恢复稳定，重新进入粗对准阶段"),
-        ("S1", "长时间无恢复", "毫米波长时间无法恢复，回到搜索阶段重新搜索目标"),
-    ],
-}
-
-UPLINK_MODE = {
-    "S0": "毫米波", "S1": "毫米波", "S2": "毫米波",
-    "S3": "太赫兹", "S4": "太赫兹", "S5": "毫米波",
-}
-
-SLOT_PACKET_SPECS = [
-    {
-        "id": "PKT_SYS_HEALTH",
-        "name": "系统自检状态包",
-        "phase": "T0",
-        "states": ["S0"],
-        "direction": "DSP内部/各模块 -> DSP",
-        "interface": "本地轮询 + 接口在线检测",
-        "cadence": "每 slot 1 次",
-        "fields": ["slot_id", "mmwave_online", "thz_fpga_online", "gimbal_online", "clock_lock", "pps_lock"],
-        "purpose": "确认毫米波、太赫兹/FPGA、云台和时钟同步链路可进入搜索流程",
-    },
-    {
-        "id": "SIG_CLOCK_SYNC",
-        "name": "时钟同步信号",
-        "phase": "T0",
-        "states": ["S0", "S3", "S4"],
-        "direction": "铷钟/恒温晶振 -> 发射机射频模块/FPGA基带板",
-        "interface": "SMA/BNC",
-        "cadence": "连续信号，按 slot 检查锁定状态",
-        "fields": ["10MHz参考信号", "1PPS信号", "clock_lock", "pps_valid"],
-        "purpose": "给太赫兹发射和基带处理提供统一时钟基准",
-    },
-    {
-        "id": "PKT_MMW_DETECT",
-        "name": "毫米波目标感知包",
-        "phase": "T1",
-        "states": ["S1", "S2", "S4", "S5"],
-        "direction": "毫米波通感基带模块 -> DSP",
-        "interface": "数字通信接口",
-        "cadence": "每 slot 1 次",
-        "fields": ["target_valid", "azimuth_deg", "elevation_deg", "range_m", "radial_speed_mps", "snr_db"],
-        "purpose": "搜索目标、粗对准角度输入、跟踪辅助和回退恢复判决",
-    },
-    {
-        "id": "PKT_MMW_RF_CTRL",
-        "name": "毫米波射频启停控制包",
-        "phase": "T1",
-        "states": ["S1", "S2", "S4", "S5"],
-        "direction": "毫米波通感基带模块 -> 毫米波射频模块",
-        "interface": "射频/中频链路控制",
-        "cadence": "状态变化时下发，每 slot 可刷新",
-        "fields": ["rf_enable", "scan_mode", "beam_id", "gain_index"],
-        "purpose": "按状态启用相控阵感知、扫描或辅助跟踪模式",
-    },
-    {
-        "id": "PKT_GIMBAL_CMD",
-        "name": "云台控制命令包",
-        "phase": "T2",
-        "states": ["S2", "S4"],
-        "direction": "DSP -> 云台",
-        "interface": "RS485",
-        "cadence": "每 slot 1 次或角度变化时下发",
-        "fields": ["cmd_seq", "target_azimuth_deg", "target_elevation_deg", "angular_speed", "fine_tune_enable"],
-        "purpose": "粗对准阶段转向目标，跟踪阶段执行小幅微调",
-    },
-    {
-        "id": "PKT_GIMBAL_FB",
-        "name": "云台反馈状态包",
-        "phase": "T3",
-        "states": ["S2", "S4", "S5"],
-        "direction": "云台 -> DSP",
-        "interface": "RS485/反馈链路",
-        "cadence": "每 slot 1 次",
-        "fields": ["current_azimuth_deg", "current_elevation_deg", "angular_speed", "in_position", "position_error_deg"],
-        "purpose": "判断云台是否转移到位，并给跟踪微调提供闭环反馈",
-    },
-    {
-        "id": "PKT_THZ_PARAM",
-        "name": "太赫兹/基带通信参数包",
-        "phase": "T2",
-        "states": ["S3", "S4"],
-        "direction": "DSP -> FPGA基带板/毫米波通感基带模块",
-        "interface": "数字通信接口",
-        "cadence": "捕获开始下发，跟踪中按需刷新",
-        "fields": ["thz_enable", "rate_level", "modulation_order", "capture_timeout_slot", "tracking_threshold"],
-        "purpose": "配置太赫兹捕获、通信速率、调制阶数和跟踪判决阈值",
-    },
-    {
-        "id": "PKT_THZ_STATUS",
-        "name": "太赫兹锁定/链路质量包",
-        "phase": "T3",
-        "states": ["S3", "S4"],
-        "direction": "太赫兹接收/基带模块 -> DSP",
-        "interface": "数字通信接口",
-        "cadence": "每 slot 1 次",
-        "fields": ["lock_flag", "link_quality", "velocity", "position", "angle", "loss_count"],
-        "purpose": "S3判断捕获成功或超时，S4判断是否失锁并进入回退",
-    },
-    {
-        "id": "PKT_THZ_BITSTREAM",
-        "name": "太赫兹业务比特流包",
-        "phase": "T4",
-        "states": ["S4"],
-        "direction": "FPGA基带板 -> 服务器/显示器/PC主机",
-        "interface": "光口 IEEE 802.3",
-        "cadence": "链路锁定后连续发送",
-        "fields": ["payload_bits", "frame_seq", "crc", "rate_level", "modulation_order"],
-        "purpose": "向上层灌包软件/显示端输出太赫兹业务数据",
-    },
-    {
-        "id": "PKT_UPLINK_STATE",
-        "name": "状态机上报包",
-        "phase": "T5",
-        "states": ["S0", "S1", "S2", "S3", "S4", "S5"],
-        "direction": "DSP -> 服务器/显示器/PC主机",
-        "interface": "上层通信链路",
-        "cadence": "每 slot 1 次",
-        "fields": ["state_id", "uplink_mode", "lock_flag", "fallback_reason", "restore_flag", "slot_id"],
-        "purpose": "给上层调度和可视化界面同步当前状态、上行模式和异常/恢复信息",
-    },
-]
-
-PHASE_LABELS = {
-    "T0": "同步/自检",
-    "T1": "感知输入",
-    "T2": "控制下发",
-    "T3": "反馈回读",
-    "T4": "业务数据",
-    "T5": "状态上报",
-}
-
-PACKET_HIGHLIGHT_GROUPS = {
-    "PKT_SYS_HEALTH": {"clock", "sync", "mmwave", "baseband", "gimbal", "state_report"},
-    "SIG_CLOCK_SYNC": {"clock", "sync"},
-    "PKT_MMW_DETECT": {"mmwave", "perception", "baseband"},
-    "PKT_MMW_RF_CTRL": {"mmwave"},
-    "PKT_GIMBAL_CMD": {"gimbal"},
-    "PKT_GIMBAL_FB": {"gimbal_feedback"},
-    "PKT_THZ_PARAM": {"fpga", "baseband"},
-    "PKT_THZ_STATUS": {"fpga", "baseband"},
-    "PKT_THZ_BITSTREAM": {"fpga", "server"},
-    "PKT_UPLINK_STATE": {"state_report", "server"},
-}
+from common.definitions import (
+    PACKET_HIGHLIGHT_GROUPS,
+    PHASE_LABELS,
+    SLOT_PACKET_SPECS,
+    STATE_DESCRIPTIONS,
+    STATE_NAMES,
+    STATE_NAMES_CN,
+    STATE_TRANSITIONS,
+    UPLINK_MODE,
+)
 
 
 # ============================================================
@@ -474,8 +306,8 @@ def _generate_architecture_echarts_legacy(current_state: str) -> str:
     # 数据流激活状态 - 根据当前状态激活对应的数据流
     active = {
         # S1搜索: 毫米波感知数据流
-        "antenna_mmwave": current_state in ["S1", "S5"],
-        "mmwave_dsp": current_state in ["S1", "S5"],
+        "antenna_mmwave": current_state in ["S1", "S3", "S5"],
+        "mmwave_dsp": current_state in ["S1", "S3", "S5"],
         # S2粗对准: 云台控制数据流
         "dsp_gimbal_ctrl": current_state in ["S2", "S4"],
         "gimbal_ctrl_gimbal": current_state in ["S2", "S4"],
@@ -937,7 +769,7 @@ def generate_architecture_echarts(current_state: str, selected_packet_id=None) -
         "S0": {"clock", "sync", "state_report"},
         "S1": {"mmwave", "perception", "state_report"},
         "S2": {"mmwave", "perception", "gimbal", "state_report"},
-        "S3": {"clock", "sync", "thz_tx", "fpga", "baseband", "state_report"},
+        "S3": {"clock", "sync", "thz_tx", "fpga", "baseband", "mmwave", "perception", "state_report"},
         "S4": {"clock", "sync", "thz_tx", "fpga", "baseband", "mmwave", "perception", "gimbal", "server", "state_report"},
         "S5": {"mmwave", "perception", "gimbal_feedback", "state_report"},
     }
