@@ -124,6 +124,9 @@ static void USART1_RawInit_115200_HSI(void);
 static void USART1_RawWriteChar(char ch);
 static void USART1_RawWriteString(const char *s);
 static void USART1_RawWriteUInt(uint32_t value);
+static void Debug_WriteString(const char *s);
+static void Debug_WriteUInt(uint32_t value);
+static void Debug_WriteHexByte(uint8_t value);
 static void PCF8574_SoftI2C_Init(void);
 static uint8_t PCF8574_WriteByte(uint8_t data);
 static void SoftI2C_SDA_Output(void);
@@ -355,6 +358,24 @@ static void USART1_RawWriteUInt(uint32_t value)
     }
 }
 
+static void Debug_WriteString(const char *s)
+{
+    USART1_RawWriteString(s);
+}
+
+static void Debug_WriteUInt(uint32_t value)
+{
+    USART1_RawWriteUInt(value);
+}
+
+static void Debug_WriteHexByte(uint8_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    USART1_RawWriteChar(hex[(value >> 4) & 0x0FU]);
+    USART1_RawWriteChar(hex[value & 0x0FU]);
+}
+
 /**
  * @brief  RS485 + Pelco-D 云台闭环测试入口。
  * @note   该测试不使用 LED，不调用 SystemClock_Config，不初始化 I2C2 HAL。
@@ -366,45 +387,47 @@ static void Board_RS485_PelcoD_TestLoop(void)
     uint8_t rx_len = 0;
 
     USART1_RawInit_115200_HSI();
+    Debug_WriteString("\r\n[BOOT] raw USART1 is alive before RS485 init.\r\n");
     DWT_Delay_Init();
 
-    printf("\r\n========================================\r\n");
-    printf("[系统] RS485 Pelco-D 云台闭环测试启动\r\n");
-    printf("[系统] USART1: PA9 raw printf, 115200 8N1\r\n");
-    printf("[系统] USART2: PA2/PA3 RS485, Pelco-D 9600 8N1\r\n");
-    printf("========================================\r\n");
+    Debug_WriteString("========================================\r\n");
+    Debug_WriteString("[SYSTEM] RS485 Pelco-D test start\r\n");
+    Debug_WriteString("[SYSTEM] USART1: PA9 raw debug, 115200 8N1\r\n");
+    Debug_WriteString("[SYSTEM] USART2: PA2/PA3 RS485, Pelco-D 9600 8N1\r\n");
+    Debug_WriteString("========================================\r\n");
 
     PCF8574_SoftI2C_Init();
     Set_RS485_Direction(0);
-    printf("[系统] PCF8574 方向控制初始化: %s，默认接收模式\r\n",
-           pcf8574_last_ack ? "ACK OK" : "ACK FAIL");
+    Debug_WriteString("[SYSTEM] PCF8574 dir init: ");
+    Debug_WriteString(pcf8574_last_ack ? "ACK OK" : "ACK FAIL");
+    Debug_WriteString(", default RX mode\r\n");
 
-    printf("[系统] 初始化 USART2...\r\n");
+    Debug_WriteString("[SYSTEM] init USART2...\r\n");
     MX_USART2_UART_Init();
-    printf("[系统] USART2 初始化完成，开始自动测试序列\r\n\r\n");
+    Debug_WriteString("[SYSTEM] USART2 init done, start sequence\r\n\r\n");
 
     while (1) {
-        printf("[系统] === 动作1: 云台左转，速度30，保持3秒 ===\r\n");
+        Debug_WriteString("[STEP] pan left, speed=30, hold=3s\r\n");
         PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_PAN_LEFT,
                                  30, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
         Board_DelayMs(3000);
 
-        printf("[系统] === 动作2: 云台停止，保持2秒 ===\r\n");
+        Debug_WriteString("[STEP] stop, hold=2s\r\n");
         PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
                                  0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
         Board_DelayMs(2000);
 
-        printf("[系统] === 动作3: 云台仰头，速度20，保持3秒 ===\r\n");
+        Debug_WriteString("[STEP] tilt up, speed=20, hold=3s\r\n");
         PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_TILT_UP,
                                  0x00, 20, rx_buf, &rx_len, RX_TIMEOUT_MS);
         Board_DelayMs(3000);
 
-        printf("[系统] === 动作4: 云台停止，保持2秒 ===\r\n");
+        Debug_WriteString("[STEP] stop, hold=2s\r\n");
         PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
                                  0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
         Board_DelayMs(2000);
 
-        printf("\r\n[系统] ---- 一个测试周期完成，1秒后开始下一周期 ----\r\n\r\n");
+        Debug_WriteString("\r\n[SYSTEM] one sequence done, restart after 1s\r\n\r\n");
         Board_DelayMs(1000);
     }
 }
@@ -584,12 +607,13 @@ static uint8_t PelcoD_CalcChecksum(const uint8_t *packet, uint8_t len)
  */
 static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len)
 {
-    // 使用 printf 经 USART1 输出到电脑
-    printf("%s ", prefix);
+    Debug_WriteString(prefix);
+    Debug_WriteString(" ");
     for (uint8_t i = 0; i < len; i++) {
-        printf("%02X ", data[i]);
+        Debug_WriteHexByte(data[i]);
+        Debug_WriteString(" ");
     }
-    printf("\r\n");
+    Debug_WriteString("\r\n");
 }
 
 /**
@@ -720,34 +744,48 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
     // ========== Step 7: 接收完成后才打印提示 (避免拖慢485方向切换和接收起始时刻) ==========
     if (tx_ret != HAL_OK) {
-        printf("[电脑提示] -> USART2 发送失败，HAL状态=%d\r\n", tx_ret);
-        PrintHexFrame("[TX帧]", tx_packet, 7);
+        Debug_WriteString("[PC] USART2 transmit failed, HAL status=");
+        Debug_WriteUInt((uint32_t)tx_ret);
+        Debug_WriteString("\r\n");
+        PrintHexFrame("[TX]", tx_packet, 7);
         return;
     }
 
-    printf("[电脑提示] -> 成功发送控制命令: ");
+    Debug_WriteString("[PC] sent command: ");
     if (cmnd2 == PELCOD_CMD_PAN_LEFT && data1 > 0) {
-        printf("云台左转(速度%d)\r\n", data1);
+        Debug_WriteString("pan left, speed=");
+        Debug_WriteUInt(data1);
+        Debug_WriteString("\r\n");
     } else if (cmnd2 == PELCOD_CMD_PAN_RIGHT && data1 > 0) {
-        printf("云台右转(速度%d)\r\n", data1);
+        Debug_WriteString("pan right, speed=");
+        Debug_WriteUInt(data1);
+        Debug_WriteString("\r\n");
     } else if (cmnd2 == PELCOD_CMD_TILT_UP && data2 > 0) {
-        printf("云台仰头(速度%d)\r\n", data2);
+        Debug_WriteString("tilt up, speed=");
+        Debug_WriteUInt(data2);
+        Debug_WriteString("\r\n");
     } else if (cmnd2 == PELCOD_CMD_TILT_DOWN && data2 > 0) {
-        printf("云台低头(速度%d)\r\n", data2);
+        Debug_WriteString("tilt down, speed=");
+        Debug_WriteUInt(data2);
+        Debug_WriteString("\r\n");
     } else {
-        printf("云台停止\r\n");
+        Debug_WriteString("stop\r\n");
     }
-    PrintHexFrame("[TX帧]", tx_packet, 7);
+    PrintHexFrame("[TX]", tx_packet, 7);
 
     if (actual_len > 0U) {
         if (rx_buf != NULL && rx_len != NULL) {
             memcpy(rx_buf, rx_temp, actual_len);
             *rx_len = actual_len;
         }
-        printf("[电脑提示] -> 收到云台回传 (%d 字节):\r\n", actual_len);
-        PrintHexFrame("[RX帧]", rx_temp, actual_len);
+        Debug_WriteString("[PC] received response, len=");
+        Debug_WriteUInt(actual_len);
+        Debug_WriteString("\r\n");
+        PrintHexFrame("[RX]", rx_temp, actual_len);
     } else {
-        printf("[电脑提示] -> 读取云台回传超时 (等待 %d ms)\r\n", timeout_ms);
+        Debug_WriteString("[PC] response timeout, wait_ms=");
+        Debug_WriteUInt(timeout_ms);
+        Debug_WriteString("\r\n");
     }
 }
 
@@ -1017,6 +1055,10 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+#if (RS485_PELCOD_TEST == 1U) || (USART1_RAW_TX_TEST == 1U)
+  USART1_RawInit_115200_HSI();
+  Debug_WriteString("\r\n[ERROR] Error_Handler entered.\r\n");
+#endif
   __disable_irq();
   while (1)
   {
