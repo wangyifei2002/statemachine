@@ -75,9 +75,19 @@
 #define USART1_BRINGUP_TEST    0U
 
 // USART1 原始串口发送测试：1=只用寄存器配置 PA9/USART1 TX，持续向电脑发送文本
-#define USART1_RAW_TX_TEST     1U
+#define USART1_RAW_TX_TEST     0U
 #define USART1_RAW_BAUDRATE    115200U
 #define USART1_RAW_CLOCK_HZ    HSI_VALUE
+
+// RS485 + Pelco-D 云台闭环测试：1=raw USART1打印 + USART2/RS485控制云台，不使用LED
+#define RS485_PELCOD_TEST      1U
+
+// 软件 I2C 控制 PCF8574，避免当前阶段依赖 CubeMX I2C2 timing
+#define PCF8574_SCL_GPIO_Port  GPIOH
+#define PCF8574_SCL_Pin        GPIO_PIN_4
+#define PCF8574_SDA_GPIO_Port  GPIOH
+#define PCF8574_SDA_Pin        GPIO_PIN_5
+#define SOFT_I2C_DELAY_US      5U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -88,6 +98,7 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
 static uint8_t pcf8574_shadow = 0xFF;
+static uint8_t pcf8574_last_ack = 0;
 static uint32_t heartbeat_last_tick = 0;
 /* USER CODE END PV */
 
@@ -108,10 +119,21 @@ static void Board_LED_EarlySelfTest(void);
 static void Board_LED_BringupLoop(void);
 static void Board_USART1_BringupLoop(void);
 static void Board_USART1_RawTxLoop(void);
+static void Board_RS485_PelcoD_TestLoop(void);
 static void USART1_RawInit_115200_HSI(void);
 static void USART1_RawWriteChar(char ch);
 static void USART1_RawWriteString(const char *s);
 static void USART1_RawWriteUInt(uint32_t value);
+static void PCF8574_SoftI2C_Init(void);
+static uint8_t PCF8574_WriteByte(uint8_t data);
+static void SoftI2C_SDA_Output(void);
+static void SoftI2C_SDA_Input(void);
+static void SoftI2C_SetSCL(uint8_t level);
+static void SoftI2C_SetSDA(uint8_t level);
+static void SoftI2C_Start(void);
+static void SoftI2C_Stop(void);
+static uint8_t SoftI2C_WriteByte(uint8_t data);
+static void Board_DelayMs(uint32_t delay_ms);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
 void delay_us(uint32_t us);
@@ -334,6 +356,192 @@ static void USART1_RawWriteUInt(uint32_t value)
 }
 
 /**
+ * @brief  RS485 + Pelco-D 云台闭环测试入口。
+ * @note   该测试不使用 LED，不调用 SystemClock_Config，不初始化 I2C2 HAL。
+ *         USART1 采用 raw TX 承载 printf，USART2 使用 HAL_UART_Transmit/Receive 控制云台。
+ */
+static void Board_RS485_PelcoD_TestLoop(void)
+{
+    uint8_t rx_buf[RX_BUFFER_SIZE];
+    uint8_t rx_len = 0;
+
+    USART1_RawInit_115200_HSI();
+    DWT_Delay_Init();
+
+    printf("\r\n========================================\r\n");
+    printf("[系统] RS485 Pelco-D 云台闭环测试启动\r\n");
+    printf("[系统] USART1: PA9 raw printf, 115200 8N1\r\n");
+    printf("[系统] USART2: PA2/PA3 RS485, Pelco-D 9600 8N1\r\n");
+    printf("========================================\r\n");
+
+    PCF8574_SoftI2C_Init();
+    Set_RS485_Direction(0);
+    printf("[系统] PCF8574 方向控制初始化: %s，默认接收模式\r\n",
+           pcf8574_last_ack ? "ACK OK" : "ACK FAIL");
+
+    printf("[系统] 初始化 USART2...\r\n");
+    MX_USART2_UART_Init();
+    printf("[系统] USART2 初始化完成，开始自动测试序列\r\n\r\n");
+
+    while (1) {
+        printf("[系统] === 动作1: 云台左转，速度30，保持3秒 ===\r\n");
+        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_PAN_LEFT,
+                                 30, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
+        Board_DelayMs(3000);
+
+        printf("[系统] === 动作2: 云台停止，保持2秒 ===\r\n");
+        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
+                                 0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
+        Board_DelayMs(2000);
+
+        printf("[系统] === 动作3: 云台仰头，速度20，保持3秒 ===\r\n");
+        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_TILT_UP,
+                                 0x00, 20, rx_buf, &rx_len, RX_TIMEOUT_MS);
+        Board_DelayMs(3000);
+
+        printf("[系统] === 动作4: 云台停止，保持2秒 ===\r\n");
+        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
+                                 0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
+        Board_DelayMs(2000);
+
+        printf("\r\n[系统] ---- 一个测试周期完成，1秒后开始下一周期 ----\r\n\r\n");
+        Board_DelayMs(1000);
+    }
+}
+
+/**
+ * @brief  初始化软件 I2C GPIO，用于控制 PCF8574。
+ */
+static void PCF8574_SoftI2C_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = PCF8574_SCL_Pin | PCF8574_SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+
+    SoftI2C_SetSCL(1);
+    SoftI2C_SetSDA(1);
+    delay_us(20);
+}
+
+/**
+ * @brief  向 PCF8574 写 1 字节。
+ * @return 1=地址和数据均收到 ACK，0=至少一次无 ACK。
+ */
+static uint8_t PCF8574_WriteByte(uint8_t data)
+{
+    uint8_t addr_ack;
+    uint8_t data_ack;
+
+    SoftI2C_Start();
+    addr_ack = SoftI2C_WriteByte(PCF8574_ADDR);
+    data_ack = SoftI2C_WriteByte(data);
+    SoftI2C_Stop();
+
+    return (uint8_t)(addr_ack && data_ack);
+}
+
+static void SoftI2C_SDA_Output(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = PCF8574_SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PCF8574_SDA_GPIO_Port, &GPIO_InitStruct);
+}
+
+static void SoftI2C_SDA_Input(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = PCF8574_SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PCF8574_SDA_GPIO_Port, &GPIO_InitStruct);
+}
+
+static void SoftI2C_SetSCL(uint8_t level)
+{
+    HAL_GPIO_WritePin(PCF8574_SCL_GPIO_Port, PCF8574_SCL_Pin,
+                      level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void SoftI2C_SetSDA(uint8_t level)
+{
+    HAL_GPIO_WritePin(PCF8574_SDA_GPIO_Port, PCF8574_SDA_Pin,
+                      level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void SoftI2C_Start(void)
+{
+    SoftI2C_SDA_Output();
+    SoftI2C_SetSDA(1);
+    SoftI2C_SetSCL(1);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSDA(0);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSCL(0);
+    delay_us(SOFT_I2C_DELAY_US);
+}
+
+static void SoftI2C_Stop(void)
+{
+    SoftI2C_SDA_Output();
+    SoftI2C_SetSDA(0);
+    SoftI2C_SetSCL(1);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSDA(1);
+    delay_us(SOFT_I2C_DELAY_US);
+}
+
+/**
+ * @brief  软件 I2C 写 1 字节并读取 ACK。
+ * @return 1=ACK，0=NACK。
+ */
+static uint8_t SoftI2C_WriteByte(uint8_t data)
+{
+    uint8_t ack;
+
+    SoftI2C_SDA_Output();
+    for (uint8_t mask = 0x80U; mask != 0U; mask >>= 1U) {
+        SoftI2C_SetSDA((data & mask) ? 1U : 0U);
+        delay_us(SOFT_I2C_DELAY_US);
+        SoftI2C_SetSCL(1);
+        delay_us(SOFT_I2C_DELAY_US);
+        SoftI2C_SetSCL(0);
+        delay_us(SOFT_I2C_DELAY_US);
+    }
+
+    SoftI2C_SetSDA(1);
+    SoftI2C_SDA_Input();
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSCL(1);
+    delay_us(SOFT_I2C_DELAY_US);
+    ack = (HAL_GPIO_ReadPin(PCF8574_SDA_GPIO_Port, PCF8574_SDA_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+    SoftI2C_SetSCL(0);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SDA_Output();
+
+    return ack;
+}
+
+/**
+ * @brief  板级延时封装，当前测试阶段不驱动 LED。
+ */
+static void Board_DelayMs(uint32_t delay_ms)
+{
+    HAL_Delay(delay_ms);
+}
+
+/**
  * @brief  通过 PCF8574 的 P6 引脚控制 RS485 收发方向
  * @param  to_transmit: 1=发送模式(高电平使能发送驱动器), 0=接收模式(低电平使能接收器)
  * @note   使用 pcf8574_shadow 保留其它扩展口位，避免切换485方向时误改其它引脚。
@@ -348,9 +556,9 @@ void Set_RS485_Direction(uint8_t to_transmit)
         pcf8574_shadow &= (uint8_t)~(1U << PCF8574_RS485_DIR_BIT);
     }
 
-    // 通过 I2C2 写 PCF8574 (PH4=SCL, PH5=SDA 由 CubeMX 配置)
-    // 超时100ms足够，PCF8574是低速扩展芯片
-    (void)HAL_I2C_Master_Transmit(&hi2c2, PCF8574_ADDR, &pcf8574_shadow, 1, 100);
+    // 当前 bring-up 阶段使用 PH4/PH5 软件 I2C，避免依赖 CubeMX I2C timing。
+    // 注意：方向切换函数内不打印，避免发送结束后切回接收被 printf 拖慢。
+    pcf8574_last_ack = PCF8574_WriteByte(pcf8574_shadow);
 }
 
 /**
@@ -560,6 +768,9 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+#if (RS485_PELCOD_TEST == 1U)
+  Board_RS485_PelcoD_TestLoop();
+#endif
 #if (USART1_RAW_TX_TEST == 1U)
   Board_USART1_RawTxLoop();
 #endif
@@ -759,24 +970,30 @@ void delay_us(uint32_t us)
 
 /**
  * @brief  重定向 printf 到 USART1
- * @note   不依赖 MicroLIB，禁用半主机避免卡死
+ * @note   同时提供 fputc 和 __io_putchar，兼容 Keil MicroLIB / 标准库 / GCC 风格 retarget。
  */
-#if defined(__MICROLIB)
-// 微库模式：实现 fputc
-__attribute__((weak)) int fputc(int ch, FILE *f)
+static int Debug_PutChar(int ch)
 {
-    (void)f;
-    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
-    return ch;
-}
+#if (RS485_PELCOD_TEST == 1U) || (USART1_RAW_TX_TEST == 1U)
+    USART1_RawWriteChar((char)ch);
 #else
-// 标准库模式：实现 __io_putchar
-int __io_putchar(int ch)
-{
     HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
+#endif
     return ch;
 }
 
+int fputc(int ch, FILE *f)
+{
+    (void)f;
+    return Debug_PutChar(ch);
+}
+
+int __io_putchar(int ch)
+{
+    return Debug_PutChar(ch);
+}
+
+#if !defined(__MICROLIB)
 // 实现标准库需要的 stub 函数，替代半主机实现
 struct __FILE { int handle; };
 __attribute__((weak)) int _sys_open(const char *name, int openmode) { (void)name; (void)openmode; return -1; }
