@@ -59,6 +59,15 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 
 /* USER CODE BEGIN Private defines */
+/* Apollo V2 STM32H743 board LEDs.
+ * DS1/LED1 green is connected to PB0.
+ * DS0/LED0 red is connected to PB1.
+ * Both LEDs are treated as active-low in the application.
+ */
+#define DS1_GREEN_Pin GPIO_PIN_0
+#define DS1_GREEN_GPIO_Port GPIOB
+#define DS0_RED_Pin GPIO_PIN_1
+#define DS0_RED_GPIO_Port GPIOB
 
 /* USER CODE END Private defines */
 

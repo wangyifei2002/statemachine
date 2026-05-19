@@ -155,7 +155,7 @@ static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len)
  */
 static void LED_Toggle_Once(void)
 {
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
+    HAL_GPIO_TogglePin(DS0_RED_GPIO_Port, DS0_RED_Pin);
 }
 
 /**
@@ -168,7 +168,7 @@ static void Heartbeat_Service(void)
 
     if ((uint32_t)(now - heartbeat_last_tick) >= HEARTBEAT_INTERVAL_MS) {
         heartbeat_last_tick = now;
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
     }
 }
 
@@ -351,9 +351,9 @@ int main(void)
   Set_RS485_Direction(0);
 
   // 3. 初始化指示灯状态：PB0心跳灯关闭，PB1动作指示灯关闭 (低电平点亮)
-  // PB0/PB1 已在 MX_GPIO_Init() 中配置为推挽输出。
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   // 绿灯灭
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   // 红灯灭
+  // DS1_GREEN/DS0_RED 已在 MX_GPIO_Init() 中配置为推挽输出。
+  HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);   // 绿灯灭
+  HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);       // 红灯灭
   heartbeat_last_tick = HAL_GetTick();
 
   // 打印系统启动信息到 USART1，波特率115200，可在电脑串口助手查看

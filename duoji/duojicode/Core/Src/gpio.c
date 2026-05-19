@@ -48,11 +48,16 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1, GPIO_PIN_RESET);
+  /* Configure LED output level.
+   * Apollo V2 H743:
+   *   DS1/green -> PB0
+   *   DS0/red   -> PB1
+   * The board LEDs are active-low, so GPIO_PIN_SET keeps them off at boot.
+   */
+  HAL_GPIO_WritePin(GPIOB, DS1_GREEN_Pin|DS0_RED_Pin, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : PB0 PB1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+  /*Configure GPIO pins : DS1_GREEN_Pin DS0_RED_Pin */
+  GPIO_InitStruct.Pin = DS1_GREEN_Pin|DS0_RED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
