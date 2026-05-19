@@ -69,7 +69,10 @@
 #define BOOT_LED_SELF_TEST_BLINKS 6U
 
 // LED-only 板级点亮测试：1=只跑LED测试，不初始化I2C/USART/RS485
-#define LED_ONLY_BRINGUP_TEST 1U
+#define LED_ONLY_BRINGUP_TEST 0U
+
+// USART1 板级串口测试：1=只跑LED+USART1测试，不初始化I2C/USART2/RS485
+#define USART1_BRINGUP_TEST    1U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -98,6 +101,7 @@ static void Heartbeat_Service(void);
 static void Delay_With_Heartbeat(uint32_t delay_ms);
 static void Board_LED_EarlySelfTest(void);
 static void Board_LED_BringupLoop(void);
+static void Board_USART1_BringupLoop(void);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
 void delay_us(uint32_t us);
@@ -163,6 +167,43 @@ static void Board_LED_BringupLoop(void)
 
         HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);   // 绿灯灭
         HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_RESET);     // 红灯亮
+        HAL_Delay(500);
+    }
+}
+
+/**
+ * @brief  LED + USART1 最小串口测试。
+ * @note   只初始化系统时钟、DS0/DS1 GPIO 和 USART1。
+ *         不初始化 I2C2、USART2、RS485，方便单独验证 USB_UART/P11/CH340/串口助手链路。
+ */
+static void Board_USART1_BringupLoop(void)
+{
+    const char *banner =
+        "\r\n[UART TEST] USART1 bring-up started. Baud=115200, 8N1.\r\n"
+        "[UART TEST] DS1/PB0 heartbeat toggles every 500ms.\r\n";
+    uint32_t tick = 0;
+
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART1_UART_Init();
+
+    HAL_UART_Transmit(&huart1, (uint8_t *)banner, strlen(banner), 200);
+    printf("[printf] USART1 printf retarget OK.\r\n");
+
+    while (1) {
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+
+        if ((tick & 1U) == 0U) {
+            HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);
+        } else {
+            HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_RESET);
+        }
+
+        printf("[UART TEST] tick=%lu, DS1/PB0 toggled, DS0/PB1=%s\r\n",
+               (unsigned long)tick,
+               ((tick & 1U) == 0U) ? "OFF" : "ON");
+
+        tick++;
         HAL_Delay(500);
     }
 }
@@ -394,6 +435,9 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+#if (USART1_BRINGUP_TEST == 1U)
+  Board_USART1_BringupLoop();
+#endif
 #if (LED_ONLY_BRINGUP_TEST == 1U)
   Board_LED_BringupLoop();
 #endif
