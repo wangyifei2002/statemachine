@@ -72,7 +72,12 @@
 #define LED_ONLY_BRINGUP_TEST 0U
 
 // USART1 板级串口测试：1=只跑LED+USART1测试，不初始化I2C/USART2/RS485
-#define USART1_BRINGUP_TEST    1U
+#define USART1_BRINGUP_TEST    0U
+
+// USART1 原始串口发送测试：1=只用寄存器配置 PA9/USART1 TX，持续向电脑发送文本
+#define USART1_RAW_TX_TEST     1U
+#define USART1_RAW_BAUDRATE    115200U
+#define USART1_RAW_CLOCK_HZ    HSI_VALUE
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -102,6 +107,11 @@ static void Delay_With_Heartbeat(uint32_t delay_ms);
 static void Board_LED_EarlySelfTest(void);
 static void Board_LED_BringupLoop(void);
 static void Board_USART1_BringupLoop(void);
+static void Board_USART1_RawTxLoop(void);
+static void USART1_RawInit_115200_HSI(void);
+static void USART1_RawWriteChar(char ch);
+static void USART1_RawWriteString(const char *s);
+static void USART1_RawWriteUInt(uint32_t value);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
 void delay_us(uint32_t us);
@@ -211,6 +221,115 @@ static void Board_USART1_BringupLoop(void)
 
         tick++;
         HAL_Delay(500);
+    }
+}
+
+/**
+ * @brief  只用 USART1 TX 的最小串口输出测试。
+ * @note   不初始化 LED、I2C、USART2、RS485，也不调用 SystemClock_Config。
+ *         直接把 USART1 内核时钟切到 HSI，并把 PA9 配置为 USART1_TX。
+ */
+static void Board_USART1_RawTxLoop(void)
+{
+    uint32_t tick = 0;
+
+    USART1_RawInit_115200_HSI();
+
+    USART1_RawWriteString("\r\n[RAW USART1] PA9 TX only, 115200 8N1, clock=HSI.\r\n");
+    USART1_RawWriteString("[RAW USART1] If you see this, USB-UART/P11/PA9 path is alive.\r\n");
+
+    while (1) {
+        USART1_RawWriteString("[RAW USART1] tick=");
+        USART1_RawWriteUInt(tick++);
+        USART1_RawWriteString("\r\n");
+        HAL_Delay(500);
+    }
+}
+
+/**
+ * @brief  用寄存器直接初始化 USART1 TX。
+ * @note   目标是排除 HAL UART、系统 PLL、其它外设初始化带来的干扰。
+ */
+static void USART1_RawInit_115200_HSI(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* 确保 HSI 和 HSI kernel clock 可用。复位后通常已经开启，这里再显式打开一次。 */
+    SET_BIT(RCC->CR, RCC_CR_HSION | RCC_CR_HSIKERON);
+    while ((RCC->CR & RCC_CR_HSIRDY) == 0U) {
+        /* wait for HSI */
+    }
+
+#if defined(RCC_D2CCIP2R_USART16SEL) && defined(RCC_USART16CLKSOURCE_HSI)
+    MODIFY_REG(RCC->D2CCIP2R, RCC_D2CCIP2R_USART16SEL, RCC_USART16CLKSOURCE_HSI);
+#endif
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_USART1_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    CLEAR_BIT(USART1->CR1, USART_CR1_UE);
+
+    USART1->CR1 = 0U;
+    USART1->CR2 = 0U;
+    USART1->CR3 = 0U;
+    USART1->PRESC = 0U;
+    USART1->BRR = (USART1_RAW_CLOCK_HZ + (USART1_RAW_BAUDRATE / 2U)) / USART1_RAW_BAUDRATE;
+    USART1->CR1 = USART_CR1_TE;
+    SET_BIT(USART1->CR1, USART_CR1_UE);
+}
+
+/**
+ * @brief  USART1 轮询发送单个字符。
+ */
+static void USART1_RawWriteChar(char ch)
+{
+    while ((USART1->ISR & USART_ISR_TXE_TXFNF) == 0U) {
+        /* wait for TX FIFO not full */
+    }
+    USART1->TDR = (uint8_t)ch;
+}
+
+/**
+ * @brief  USART1 轮询发送字符串。
+ */
+static void USART1_RawWriteString(const char *s)
+{
+    while (s != NULL && *s != '\0') {
+        USART1_RawWriteChar(*s++);
+    }
+
+    while ((USART1->ISR & USART_ISR_TC) == 0U) {
+        /* wait for complete transmission */
+    }
+}
+
+/**
+ * @brief  USART1 轮询发送十进制无符号整数。
+ */
+static void USART1_RawWriteUInt(uint32_t value)
+{
+    char buf[10];
+    uint32_t i = 0;
+
+    if (value == 0U) {
+        USART1_RawWriteChar('0');
+        return;
+    }
+
+    while (value > 0U && i < sizeof(buf)) {
+        buf[i++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    }
+
+    while (i > 0U) {
+        USART1_RawWriteChar(buf[--i]);
     }
 }
 
@@ -441,6 +560,9 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+#if (USART1_RAW_TX_TEST == 1U)
+  Board_USART1_RawTxLoop();
+#endif
 #if (USART1_BRINGUP_TEST == 1U)
   Board_USART1_BringupLoop();
 #endif
