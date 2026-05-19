@@ -31,6 +31,12 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct {
+    const char *name;
+    uint8_t cmnd2;
+    uint8_t data1;
+    uint8_t data2;
+} PelcoDPatternStep;
 
 /* USER CODE END PTD */
 
@@ -61,6 +67,12 @@
 #define RX_TIMEOUT_MS           200
 #define RX_BUFFER_SIZE          16U
 #define RX_INTER_BYTE_TIMEOUT_MS 20U
+
+// 云台巡检动作节拍：每 0.5 秒切换一次动作，便于肉眼确认方向
+#define PATTERN_STEP_INTERVAL_MS 500U
+#define PATTERN_RX_TIMEOUT_MS    50U
+#define PATTERN_PAN_SPEED        30U
+#define PATTERN_TILT_SPEED       20U
 
 // PB0 心跳灯闪烁间隔 (ms)，用于证明主循环未卡死
 #define HEARTBEAT_INTERVAL_MS   500U
@@ -120,6 +132,7 @@ static void Board_LED_BringupLoop(void);
 static void Board_USART1_BringupLoop(void);
 static void Board_USART1_RawTxLoop(void);
 static void Board_RS485_PelcoD_TestLoop(void);
+static void Run_PelcoD_PatternStep(const PelcoDPatternStep *step);
 static void USART1_RawInit_115200_HSI(void);
 static void USART1_RawWriteChar(char ch);
 static void USART1_RawWriteString(const char *s);
@@ -383,8 +396,24 @@ static void Debug_WriteHexByte(uint8_t value)
  */
 static void Board_RS485_PelcoD_TestLoop(void)
 {
-    uint8_t rx_buf[RX_BUFFER_SIZE];
-    uint8_t rx_len = 0;
+    static const PelcoDPatternStep pattern[] = {
+        {"left",       PELCOD_CMD_PAN_LEFT,                          PATTERN_PAN_SPEED,  0U},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"right",      PELCOD_CMD_PAN_RIGHT,                         PATTERN_PAN_SPEED,  0U},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"up",         PELCOD_CMD_TILT_UP,                           0U,                 PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"down",       PELCOD_CMD_TILT_DOWN,                         0U,                 PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"left-up",    PELCOD_CMD_PAN_LEFT | PELCOD_CMD_TILT_UP,     PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"right-up",   PELCOD_CMD_PAN_RIGHT | PELCOD_CMD_TILT_UP,    PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"left-down",  PELCOD_CMD_PAN_LEFT | PELCOD_CMD_TILT_DOWN,   PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"right-down", PELCOD_CMD_PAN_RIGHT | PELCOD_CMD_TILT_DOWN,  PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+    };
 
     USART1_RawInit_115200_HSI();
     Debug_WriteString("\r\n[BOOT] raw USART1 is alive before RS485 init.\r\n");
@@ -407,28 +436,43 @@ static void Board_RS485_PelcoD_TestLoop(void)
     Debug_WriteString("[SYSTEM] USART2 init done, start sequence\r\n\r\n");
 
     while (1) {
-        Debug_WriteString("[STEP] pan left, speed=30, hold=3s\r\n");
-        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_PAN_LEFT,
-                                 30, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-        Board_DelayMs(3000);
+        for (uint32_t i = 0; i < (sizeof(pattern) / sizeof(pattern[0])); i++) {
+            Run_PelcoD_PatternStep(&pattern[i]);
+        }
 
-        Debug_WriteString("[STEP] stop, hold=2s\r\n");
-        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
-                                 0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-        Board_DelayMs(2000);
+        Debug_WriteString("\r\n[SYSTEM] one direction-check sequence done\r\n\r\n");
+    }
+}
 
-        Debug_WriteString("[STEP] tilt up, speed=20, hold=3s\r\n");
-        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_TILT_UP,
-                                 0x00, 20, rx_buf, &rx_len, RX_TIMEOUT_MS);
-        Board_DelayMs(3000);
+/**
+ * @brief  执行一个 0.5 秒巡检动作。
+ * @note   总节拍包含发送、短接收窗口和剩余等待时间，尽量保持 500ms 切换一次。
+ */
+static void Run_PelcoD_PatternStep(const PelcoDPatternStep *step)
+{
+    uint8_t rx_buf[RX_BUFFER_SIZE];
+    uint8_t rx_len = 0;
+    uint32_t start_tick;
+    uint32_t elapsed_ms;
 
-        Debug_WriteString("[STEP] stop, hold=2s\r\n");
-        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
-                                 0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-        Board_DelayMs(2000);
+    if (step == NULL) {
+        return;
+    }
 
-        Debug_WriteString("\r\n[SYSTEM] one sequence done, restart after 1s\r\n\r\n");
-        Board_DelayMs(1000);
+    Debug_WriteString("[STEP] ");
+    Debug_WriteString(step->name);
+    Debug_WriteString(", interval_ms=");
+    Debug_WriteUInt(PATTERN_STEP_INTERVAL_MS);
+    Debug_WriteString("\r\n");
+
+    start_tick = HAL_GetTick();
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, step->cmnd2,
+                             step->data1, step->data2, rx_buf, &rx_len,
+                             PATTERN_RX_TIMEOUT_MS);
+
+    elapsed_ms = (uint32_t)(HAL_GetTick() - start_tick);
+    if (elapsed_ms < PATTERN_STEP_INTERVAL_MS) {
+        Board_DelayMs(PATTERN_STEP_INTERVAL_MS - elapsed_ms);
     }
 }
 
@@ -752,24 +796,27 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
     }
 
     Debug_WriteString("[PC] sent command: ");
-    if (cmnd2 == PELCOD_CMD_PAN_LEFT && data1 > 0) {
-        Debug_WriteString("pan left, speed=");
-        Debug_WriteUInt(data1);
-        Debug_WriteString("\r\n");
-    } else if (cmnd2 == PELCOD_CMD_PAN_RIGHT && data1 > 0) {
-        Debug_WriteString("pan right, speed=");
-        Debug_WriteUInt(data1);
-        Debug_WriteString("\r\n");
-    } else if (cmnd2 == PELCOD_CMD_TILT_UP && data2 > 0) {
-        Debug_WriteString("tilt up, speed=");
-        Debug_WriteUInt(data2);
-        Debug_WriteString("\r\n");
-    } else if (cmnd2 == PELCOD_CMD_TILT_DOWN && data2 > 0) {
-        Debug_WriteString("tilt down, speed=");
-        Debug_WriteUInt(data2);
-        Debug_WriteString("\r\n");
-    } else {
+    if (cmnd2 == PELCOD_CMD_STOP) {
         Debug_WriteString("stop\r\n");
+    } else {
+        Debug_WriteString("move");
+        if ((cmnd2 & PELCOD_CMD_PAN_LEFT) != 0U) {
+            Debug_WriteString(" left");
+        }
+        if ((cmnd2 & PELCOD_CMD_PAN_RIGHT) != 0U) {
+            Debug_WriteString(" right");
+        }
+        if ((cmnd2 & PELCOD_CMD_TILT_UP) != 0U) {
+            Debug_WriteString(" up");
+        }
+        if ((cmnd2 & PELCOD_CMD_TILT_DOWN) != 0U) {
+            Debug_WriteString(" down");
+        }
+        Debug_WriteString(", pan_speed=");
+        Debug_WriteUInt(data1);
+        Debug_WriteString(", tilt_speed=");
+        Debug_WriteUInt(data2);
+        Debug_WriteString("\r\n");
     }
     PrintHexFrame("[TX]", tx_packet, 7);
 
