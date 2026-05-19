@@ -64,6 +64,12 @@
 
 // PB0 心跳灯闪烁间隔 (ms)，用于证明主循环未卡死
 #define HEARTBEAT_INTERVAL_MS   500U
+
+// 上电早期 LED 自检闪烁次数；如果要跳过自检，可改为 0
+#define BOOT_LED_SELF_TEST_BLINKS 6U
+
+// LED-only 板级点亮测试：1=只跑LED测试，不初始化I2C/USART/RS485
+#define LED_ONLY_BRINGUP_TEST 1U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -90,6 +96,8 @@ static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len);
 static void LED_Toggle_Once(void);
 static void Heartbeat_Service(void);
 static void Delay_With_Heartbeat(uint32_t delay_ms);
+static void Board_LED_EarlySelfTest(void);
+static void Board_LED_BringupLoop(void);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
 void delay_us(uint32_t us);
@@ -97,6 +105,67 @@ void delay_us(uint32_t us);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+ * @brief  上电早期 LED 自检。
+ * @note   该函数在 SystemClock_Config、I2C、USART 初始化之前运行。
+ *         如果 DS1/PB0 在这里也不闪，优先排查固件启动、BOOT、LED硬件或板级跳线。
+ */
+static void Board_LED_EarlySelfTest(void)
+{
+#if (BOOT_LED_SELF_TEST_BLINKS > 0U)
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = DS1_GREEN_Pin | DS0_RED_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);
+
+    for (uint32_t i = 0; i < BOOT_LED_SELF_TEST_BLINKS; i++) {
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+        HAL_GPIO_TogglePin(DS0_RED_GPIO_Port, DS0_RED_Pin);
+        HAL_Delay(250);
+    }
+
+    HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);
+#endif
+}
+
+/**
+ * @brief  最小 LED 点亮/闪烁测试。
+ * @note   用于板级排查：不进入 SystemClock_Config，不初始化 I2C/USART/RS485。
+ *         如果这个循环里 DS1/PB0 仍不亮，问题基本在下载启动、LED管脚、跳线或硬件。
+ */
+static void Board_LED_BringupLoop(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = DS1_GREEN_Pin | DS0_RED_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    while (1) {
+        // 正点原子板载 DS0/DS1 按低电平点亮处理。
+        HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_RESET); // 绿灯亮
+        HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);       // 红灯灭
+        HAL_Delay(500);
+
+        HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);   // 绿灯灭
+        HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_RESET);     // 红灯亮
+        HAL_Delay(500);
+    }
+}
 
 /**
  * @brief  通过 PCF8574 的 P6 引脚控制 RS485 收发方向
@@ -325,6 +394,10 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+#if (LED_ONLY_BRINGUP_TEST == 1U)
+  Board_LED_BringupLoop();
+#endif
+  Board_LED_EarlySelfTest();
 
   /* USER CODE END Init */
 
