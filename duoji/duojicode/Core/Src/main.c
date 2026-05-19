@@ -393,7 +393,7 @@ static void Board_RS485_PelcoD_TestLoop(void)
     Debug_WriteString("========================================\r\n");
     Debug_WriteString("[SYSTEM] RS485 Pelco-D test start\r\n");
     Debug_WriteString("[SYSTEM] USART1: PA9 raw debug, 115200 8N1\r\n");
-    Debug_WriteString("[SYSTEM] USART2: PA2/PA3 RS485, Pelco-D 9600 8N1\r\n");
+    Debug_WriteString("[SYSTEM] USART2: PA2/PA3 RS485, Pelco-D 115200 8N1\r\n");
     Debug_WriteString("========================================\r\n");
 
     PCF8574_SoftI2C_Init();
@@ -728,7 +728,7 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
     HAL_StatusTypeDef tx_ret = HAL_UART_Transmit(&huart2, tx_packet, 7, 100);
 
     // ========== Step 4: 极短延时确保最后一bit已从TX线移出 ==========
-    // USART2 为 9600bps，HAL_UART_Transmit 返回前通常已等待 TC；
+    // USART2 为 115200bps，HAL_UART_Transmit 返回前通常已等待 TC；
     // 这里保留一个很短的保护间隔，再立即切回接收。
     // 延时后必须立即切回接收，切方向绝不能被任何打印拖慢！
     delay_us(RS485_TX_GAP_US);
