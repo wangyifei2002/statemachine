@@ -173,7 +173,8 @@ static void Board_LED_BringupLoop(void)
 
 /**
  * @brief  LED + USART1 最小串口测试。
- * @note   只初始化系统时钟、DS0/DS1 GPIO 和 USART1。
+ * @note   只初始化 DS0/DS1 GPIO 和 USART1。
+ *         刻意不调用 SystemClock_Config，避免外部 HSE/PLL 配置问题挡住 LED/串口排查。
  *         不初始化 I2C2、USART2、RS485，方便单独验证 USB_UART/P11/CH340/串口助手链路。
  */
 static void Board_USART1_BringupLoop(void)
@@ -183,8 +184,13 @@ static void Board_USART1_BringupLoop(void)
         "[UART TEST] DS1/PB0 heartbeat toggles every 500ms.\r\n";
     uint32_t tick = 0;
 
-    SystemClock_Config();
     MX_GPIO_Init();
+
+    for (uint32_t i = 0; i < 4U; i++) {
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+        HAL_Delay(125);
+    }
+
     MX_USART1_UART_Init();
 
     HAL_UART_Transmit(&huart1, (uint8_t *)banner, strlen(banner), 200);
