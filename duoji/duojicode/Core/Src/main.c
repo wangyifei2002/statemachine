@@ -62,8 +62,8 @@
 #define RX_BUFFER_SIZE          16U
 #define RX_INTER_BYTE_TIMEOUT_MS 20U
 
-// LED 闪烁间隔 (ms)
-#define LED_TOGGLE_INTERVAL_MS  100
+// PB0 心跳灯闪烁间隔 (ms)，用于证明主循环未卡死
+#define HEARTBEAT_INTERVAL_MS   500U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +74,7 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
 static uint8_t pcf8574_shadow = 0xFF;
+static uint32_t heartbeat_last_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -87,6 +88,8 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 static uint8_t PelcoD_CalcChecksum(const uint8_t *packet, uint8_t len);
 static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len);
 static void LED_Toggle_Once(void);
+static void Heartbeat_Service(void);
+static void Delay_With_Heartbeat(uint32_t delay_ms);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
 void delay_us(uint32_t us);
@@ -147,13 +150,41 @@ static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len)
 }
 
 /**
- * @brief  翻转 PB0 和 PB1 的电平状态 (实现绿色/红色 LED 闪烁指示)
- * @note   每次调用时两个灯状态同时翻转，用于指示动作切换时刻
+ * @brief  翻转 PB1 红灯，用于指示测试动作发生切换。
+ * @note   PB0 独立作为 500ms 心跳灯，不再由动作切换函数控制。
  */
 static void LED_Toggle_Once(void)
 {
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);  // 绿灯
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);  // 红灯
+    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
+}
+
+/**
+ * @brief  PB0 绿灯 500ms 心跳服务。
+ * @note   需要在主循环和长延时中周期性调用；使用 HAL_GetTick，可自然处理计数回绕。
+ */
+static void Heartbeat_Service(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((uint32_t)(now - heartbeat_last_tick) >= HEARTBEAT_INTERVAL_MS) {
+        heartbeat_last_tick = now;
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+    }
+}
+
+/**
+ * @brief  带心跳服务的阻塞延时。
+ * @param  delay_ms: 延时时间，单位 ms。
+ * @note   替代直接 HAL_Delay(3000/2000)，避免长延时期间 PB0 心跳停止。
+ */
+static void Delay_With_Heartbeat(uint32_t delay_ms)
+{
+    uint32_t start = HAL_GetTick();
+
+    while ((uint32_t)(HAL_GetTick() - start) < delay_ms) {
+        Heartbeat_Service();
+        HAL_Delay(10);
+    }
 }
 
 /**
@@ -319,10 +350,11 @@ int main(void)
   // 2. 默认将 RS485 设为接收模式，确保上电后不会导致总线冲突
   Set_RS485_Direction(0);
 
-  // 3. 初始化指示灯状态：两个灯都关闭 (低电平点亮)
+  // 3. 初始化指示灯状态：PB0心跳灯关闭，PB1动作指示灯关闭 (低电平点亮)
   // PB0/PB1 已在 MX_GPIO_Init() 中配置为推挽输出。
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   // 绿灯灭
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   // 红灯灭
+  heartbeat_last_tick = HAL_GetTick();
 
   // 打印系统启动信息到 USART1，波特率115200，可在电脑串口助手查看
   printf("\r\n========================================\r\n");
@@ -343,46 +375,49 @@ int main(void)
     // ========== 工业云台自动化测试序列 (半双工闭环) ==========
     //
     // 测试流程：
-    //   动作1: 云台左转(速度0x1E=30) → 保持3秒 → LED闪烁
-    //   动作2: 云台停止 → 保持2秒   → LED闪烁
-    //   动作3: 云台仰头(速度0x14=20) → 保持3秒 → LED闪烁
-    //   动作4: 云台停止 → 保持2秒   → LED闪烁
+    //   动作1: 云台左转(速度0x1E=30) → 保持3秒 → PB1动作指示翻转
+    //   动作2: 云台停止 → 保持2秒   → PB1动作指示翻转
+    //   动作3: 云台仰头(速度0x14=20) → 保持3秒 → PB1动作指示翻转
+    //   动作4: 云台停止 → 保持2秒   → PB1动作指示翻转
+    //   PB0绿灯在整个主循环中保持500ms心跳闪烁，用于证明程序正常运行
     // 循环往复，每步均通过 PelcoD_Control_And_Query 发送指令并接收云台反馈
 
     uint8_t rx_buf[16];
     uint8_t rx_len = 0;
+
+    Heartbeat_Service();
 
     // ----- 动作1: 左转 (命令码0x04, 水平速度30) -----
     printf("[系统] === 动作1: 云台左转(速度30) ===\r\n");
     LED_Toggle_Once();
     PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_PAN_LEFT,
                              30, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    HAL_Delay(3000);  // 保持左转3秒，期间云台持续执行
+    Delay_With_Heartbeat(3000);  // 保持左转3秒，期间云台持续执行
 
     // ----- 动作2: 停止 -----
     printf("[系统] === 动作2: 云台停止 ===\r\n");
     LED_Toggle_Once();
     PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
                              0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    HAL_Delay(2000);  // 停止保持2秒
+    Delay_With_Heartbeat(2000);  // 停止保持2秒
 
     // ----- 动作3: 仰头 (命令码0x08, 垂直速度20) -----
     printf("[系统] === 动作3: 云台仰头(速度20) ===\r\n");
     LED_Toggle_Once();
     PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_TILT_UP,
                              0x00, 20, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    HAL_Delay(3000);  // 保持仰头3秒
+    Delay_With_Heartbeat(3000);  // 保持仰头3秒
 
     // ----- 动作4: 停止 -----
     printf("[系统] === 动作4: 云台停止 ===\r\n");
     LED_Toggle_Once();
     PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
                              0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    HAL_Delay(2000);  // 停止保持2秒
+    Delay_With_Heartbeat(2000);  // 停止保持2秒
 
     // 一个完整测试周期结束后，打印分隔线，便于观察电脑端串口输出
     printf("\r\n[系统] ---- 一个测试周期完成，休息1秒后开始下一周期 ----\r\n\r\n");
-    HAL_Delay(1000);
+    Delay_With_Heartbeat(1000);
 
     /* USER CODE END 3 */
   }
