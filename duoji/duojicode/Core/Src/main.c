@@ -39,6 +39,7 @@
 // ========== 硬件配置参数 ==========
 // PCF8574 I2C 地址 (7位地址为 0x20, 写操作时左移1位为 0x40)
 #define PCF8574_ADDR           0x40
+#define PCF8574_RS485_DIR_BIT  6U
 
 // Pelco-D 协议固定帧头
 #define PELCOD_SYNC_BYTE       0xFF
@@ -58,6 +59,8 @@
 
 // 接收超时时间 (ms)
 #define RX_TIMEOUT_MS           200
+#define RX_BUFFER_SIZE          16U
+#define RX_INTER_BYTE_TIMEOUT_MS 20U
 
 // LED 闪烁间隔 (ms)
 #define LED_TOGGLE_INTERVAL_MS  100
@@ -69,7 +72,9 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-/* USER CODE END PD */
+/* USER CODE BEGIN PV */
+static uint8_t pcf8574_shadow = 0xFF;
+/* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -82,6 +87,8 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 static uint8_t PelcoD_CalcChecksum(const uint8_t *packet, uint8_t len);
 static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len);
 static void LED_Toggle_Once(void);
+static void DWT_Delay_Init(void);
+static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
 void delay_us(uint32_t us);
 /* USER CODE END PFP */
 
@@ -91,23 +98,21 @@ void delay_us(uint32_t us);
 /**
  * @brief  通过 PCF8574 的 P6 引脚控制 RS485 收发方向
  * @param  to_transmit: 1=发送模式(高电平使能发送驱动器), 0=接收模式(低电平使能接收器)
- * @note   PCF8574 每个引脚默认配置为高电平输出(开漏)，所以写入时需保持其他位不变
+ * @note   使用 pcf8574_shadow 保留其它扩展口位，避免切换485方向时误改其它引脚。
  */
 void Set_RS485_Direction(uint8_t to_transmit)
 {
-    uint8_t pcf8574_data = 0xFF; // 默认所有引脚为高，保留其他位状态
-
     if (to_transmit) {
         // 发送模式：P6 置高
-        pcf8574_data |= (1 << 6);
+        pcf8574_shadow |= (uint8_t)(1U << PCF8574_RS485_DIR_BIT);
     } else {
         // 接收模式：P6 置低
-        pcf8574_data &= ~(1 << 6);
+        pcf8574_shadow &= (uint8_t)~(1U << PCF8574_RS485_DIR_BIT);
     }
 
     // 通过 I2C2 写 PCF8574 (PH4=SCL, PH5=SDA 由 CubeMX 配置)
     // 超时100ms足够，PCF8574是低速扩展芯片
-    HAL_I2C_Master_Transmit(&hi2c2, PCF8574_ADDR, &pcf8574_data, 1, 100);
+    (void)HAL_I2C_Master_Transmit(&hi2c2, PCF8574_ADDR, &pcf8574_shadow, 1, 100);
 }
 
 /**
@@ -152,17 +157,40 @@ static void LED_Toggle_Once(void)
 }
 
 /**
+ * @brief  使用 HAL_UART_Receive 带超时读取一帧可能长度不固定的云台回传。
+ * @note   第一字节使用业务超时，后续字节使用较短字节间超时。
+ *         这样不会固定等待16字节，也不会把 Pelco-D 帧头 0xFF 误判为结束符。
+ */
+static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms)
+{
+    uint8_t len = 0;
+
+    if (rx_buf == NULL || max_len == 0U) {
+        return 0;
+    }
+
+    while (len < max_len) {
+        uint16_t timeout = (len == 0U) ? first_byte_timeout_ms : RX_INTER_BYTE_TIMEOUT_MS;
+        if (HAL_UART_Receive(&huart2, &rx_buf[len], 1, timeout) != HAL_OK) {
+            break;
+        }
+        len++;
+    }
+
+    return len;
+}
+
+/**
  * @brief  完整的 Pelco-D 半双工闭环控制+查询函数
  *
  * 该函数执行以下步骤：
  *   1. 组装7字节标准 Pelco-D 指令帧 (同步头+地址+命令1+命令2+数据1+数据2+校验和)
  *   2. 切换 RS485 为发送模式
  *   3. 通过 USART2 阻塞发送7字节
- *   4. 打印发送提示到 USART1 (电脑端可见)
- *   5. 延时极短时间确保发送完成
- *   6. 立即切换 RS485 为接收模式
- *   7. 调用 HAL_UART_Receive 带超时等待云台回传
- *   8. 根据结果打印回传数据或超时提示
+ *   4. 延时极短时间确保最后一个bit离开发送器
+ *   5. 立即切换 RS485 为接收模式
+ *   6. 调用 HAL_UART_Receive 带超时等待云台回传
+ *   7. 根据结果打印发送提示、回传数据或超时提示
  *
  * @param  addr:      云台设备地址 (默认0x01)
  * @param  cmnd1:    命令字节1 (通常为0x00或与镜物选择有关)
@@ -178,7 +206,12 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
                               uint8_t *rx_len, uint16_t timeout_ms)
 {
     uint8_t tx_packet[7];
-    uint8_t rx_temp[16] = {0};
+    uint8_t rx_temp[RX_BUFFER_SIZE] = {0};
+    uint8_t actual_len = 0;
+
+    if (rx_len != NULL) {
+        *rx_len = 0;
+    }
 
     // ========== Step 1: 组装 Pelco-D 指令帧 ==========
     tx_packet[0] = PELCOD_SYNC_BYTE;     // 同步头固定 0xFF
@@ -194,10 +227,11 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
     Set_RS485_Direction(1);  // P6=1，发送驱动器使能
 
     // ========== Step 3: 阻塞发送7字节指令 ==========
-    HAL_UART_Transmit(&huart2, tx_packet, 7, 100);
+    HAL_StatusTypeDef tx_ret = HAL_UART_Transmit(&huart2, tx_packet, 7, 100);
 
     // ========== Step 4: 极短延时确保最后一bit已从TX线移出 ==========
-    // 对于 115200 波特率，1bit ≈ 8.68us，7字节≈70us
+    // USART2 为 9600bps，HAL_UART_Transmit 返回前通常已等待 TC；
+    // 这里保留一个很短的保护间隔，再立即切回接收。
     // 延时后必须立即切回接收，切方向绝不能被任何打印拖慢！
     delay_us(RS485_TX_GAP_US);
 
@@ -206,28 +240,17 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
     // ========== Step 6: 等待接收云台回传 (在切换到RX后立即开始) ==========
     memset(rx_temp, 0, sizeof(rx_temp));
-    HAL_StatusTypeDef ret = HAL_UART_Receive(&huart2, rx_temp, 16, timeout_ms);
-
-    // ========== Step 7: 接收完成后才打印提示 (避免拖慢485方向切换) ==========
-    if (ret == HAL_OK) {
-        uint8_t actual_len = 0;
-        for (int i = 0; i < 16; i++) {
-            if (rx_temp[i] == 0xFF || rx_temp[i] == 0x0D) {
-                actual_len = i + 1;
-                break;
-            }
-            if (i == 15) actual_len = 16;
-        }
-        memcpy(rx_buf, rx_temp, actual_len);
-        *rx_len = actual_len;
-        printf("[电脑提示] -> 收到云台回传 (%d 字节):\r\n", actual_len);
-        PrintHexFrame("[RX帧]", rx_buf, actual_len);
-    } else {
-        *rx_len = 0;
-        printf("[电脑提示] -> 读取云台回传超时 (等待 %d ms)\r\n", timeout_ms);
+    if (tx_ret == HAL_OK) {
+        actual_len = PelcoD_ReceiveResponse(rx_temp, RX_BUFFER_SIZE, timeout_ms);
     }
 
-    // ========== Step 8: 打印本次发送的动作描述 (接收完成后打印，不影响时序) ==========
+    // ========== Step 7: 接收完成后才打印提示 (避免拖慢485方向切换和接收起始时刻) ==========
+    if (tx_ret != HAL_OK) {
+        printf("[电脑提示] -> USART2 发送失败，HAL状态=%d\r\n", tx_ret);
+        PrintHexFrame("[TX帧]", tx_packet, 7);
+        return;
+    }
+
     printf("[电脑提示] -> 成功发送控制命令: ");
     if (cmnd2 == PELCOD_CMD_PAN_LEFT && data1 > 0) {
         printf("云台左转(速度%d)\r\n", data1);
@@ -241,6 +264,17 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
         printf("云台停止\r\n");
     }
     PrintHexFrame("[TX帧]", tx_packet, 7);
+
+    if (actual_len > 0U) {
+        if (rx_buf != NULL && rx_len != NULL) {
+            memcpy(rx_buf, rx_temp, actual_len);
+            *rx_len = actual_len;
+        }
+        printf("[电脑提示] -> 收到云台回传 (%d 字节):\r\n", actual_len);
+        PrintHexFrame("[RX帧]", rx_temp, actual_len);
+    } else {
+        printf("[电脑提示] -> 读取云台回传超时 (等待 %d ms)\r\n", timeout_ms);
+    }
 }
 
 /* USER CODE END 0 */
@@ -279,21 +313,14 @@ int main(void)
   /* USER CODE BEGIN 2 */
   // ========== 系统初始化 ==========
 
-  // 1. 使能 GPIOB 时钟 (PB0/PB1 用于 LED)
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+  // 1. 初始化 DWT 计数器，为 RS485 收发切换提供微秒级保护延时
+  DWT_Delay_Init();
 
-  // 2. 配置 PB0/PB1 为推挽输出模式 (绿灯=PB0, 红灯=PB1)
-  GPIO_InitTypeDef led_init = {0};
-  led_init.Pin   = GPIO_PIN_0 | GPIO_PIN_1;
-  led_init.Mode  = GPIO_MODE_OUTPUT_PP;
-  led_init.Pull  = GPIO_NOPULL;
-  led_init.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &led_init);
-
-  // 3. 默认将 RS485 设为接收模式，确保上电后不会导致总线冲突
+  // 2. 默认将 RS485 设为接收模式，确保上电后不会导致总线冲突
   Set_RS485_Direction(0);
 
-  // 4. 初始化指示灯状态：两个灯都关闭 (低电平点亮)
+  // 3. 初始化指示灯状态：两个灯都关闭 (低电平点亮)
+  // PB0/PB1 已在 MX_GPIO_Init() 中配置为推挽输出。
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   // 绿灯灭
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   // 红灯灭
 
@@ -422,13 +449,27 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /**
+ * @brief  初始化 Cortex-M7 DWT 周期计数器。
+ * @note   delay_us() 依赖 CYCCNT。如果不显式打开，部分调试/启动环境下计数器可能不走。
+ */
+static void DWT_Delay_Init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+/**
  * @brief  微秒级延时函数 (使用 DWT Cycle Count 实现高精度延时)
  * @param  us: 延时微秒数
- * @note   需要在 CoreDebug->DEMCR 中使能 TRCENA，DWT->CYCCNT 必须未禁用
- *         STM32H7 默认情况下 DWT 可直接使用，无需额外配置
+ * @note   在 USER CODE 2 中调用 DWT_Delay_Init() 后使用。
  */
 void delay_us(uint32_t us)
 {
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+        DWT_Delay_Init();
+    }
+
     uint32_t cycles = us * (SystemCoreClock / 1000000U);
     uint32_t start = DWT->CYCCNT;
     while ((DWT->CYCCNT - start) < cycles) {
