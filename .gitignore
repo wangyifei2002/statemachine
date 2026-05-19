@@ -1,2 +1,4 @@
 .claude
 .cursor
+__pycache__/
+.venv/
