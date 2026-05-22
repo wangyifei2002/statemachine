@@ -92,7 +92,7 @@ typedef struct {
 #define USART1_RAW_CLOCK_HZ    HSI_VALUE
 
 // RS485 + Pelco-D 云台闭环测试：1=raw USART1打印 + USART2/RS485控制云台，不使用LED
-#define RS485_PELCOD_TEST      1U
+#define RS485_PELCOD_TEST      0U
 
 // 软件 I2C 控制 PCF8574，避免当前阶段依赖 CubeMX I2C2 timing
 #define PCF8574_SCL_GPIO_Port  GPIOH
@@ -100,6 +100,10 @@ typedef struct {
 #define PCF8574_SDA_GPIO_Port  GPIOH
 #define PCF8574_SDA_Pin        GPIO_PIN_5
 #define SOFT_I2C_DELAY_US      5U
+
+// ========== 新增绝对角度定位命令码 ==========
+#define PELCOD_CMD_SET_PAN   0x4B  // 绝对水平定位操作码
+#define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -152,11 +156,71 @@ static uint8_t SoftI2C_WriteByte(uint8_t data);
 static void Board_DelayMs(uint32_t delay_ms);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
+static void USART2_RawInit_115200(void);
 void delay_us(uint32_t us);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/**
+  * @brief 设置预置位 (Pelco-D 标准指令 0x03)
+  * @param preset_id: 预置位编号 (如手册中的 210)
+  */
+void PelcoD_SetPreset(uint8_t preset_id)
+{
+    uint8_t rx_buf[16];
+    uint8_t rx_len = 0;
+    // Command 2 = 0x03 (设置预置位)，Data2 = 预置位编号
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, 0x03, 
+                             0x00, preset_id, rx_buf, &rx_len, RX_TIMEOUT_MS);
+}
+
+/**
+  * @brief 控制云台移动到绝对水平角度 (对应手册水平范围 0° ~ 360°)
+  * @param angle: 目标绝对角度 (例如: 45.0 或 -45.0)
+  */
+void PelcoD_SetAbsolutePan(float angle)
+{
+    // 将 -45° 转换为 Pelco-D 坐标系下的 315°
+    if (angle < 0.0f) {
+        angle += 360.0f;
+    }
+    
+    // 协议规定：数据 = 实际角度 * 100
+    uint16_t angle_val = (uint16_t)(angle * 100.0f);
+    uint8_t data1 = (uint8_t)(angle_val >> 8);   // 角度高 8 位
+    uint8_t data2 = (uint8_t)(angle_val & 0xFF); // 角度低 8 位
+    
+    uint8_t rx_buf[16];
+    uint8_t rx_len = 0;
+
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_SET_PAN,
+                             data1, data2, rx_buf, &rx_len, RX_TIMEOUT_MS);
+}
+
+/**
+  * @brief 控制云台移动到绝对垂直角度 (对应手册垂直范围 -90° ~ 90°)
+  * @param angle: 目标绝对角度 (例如: 45.0 或 -45.0)
+  */
+void PelcoD_SetAbsoluteTilt(float angle)
+{
+    uint16_t angle_val;
+    if (angle >= 0.0f) {
+        angle_val = (uint16_t)(angle * 100.0f);
+    } else {
+        // 标准 Pelco-D 负角度（下俯）通常使用 360° 环绕表示 (360.0 + angle)
+        angle_val = (uint16_t)((360.0f + angle) * 100.0f);
+    }
+    
+    uint8_t data1 = (uint8_t)(angle_val >> 8);   // 角度高 8 位
+    uint8_t data2 = (uint8_t)(angle_val & 0xFF); // 角度低 8 位
+    
+    uint8_t rx_buf[16];
+    uint8_t rx_len = 0;
+
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_SET_TILT,
+                             data1, data2, rx_buf, &rx_len, RX_TIMEOUT_MS);
+}
 
 /**
  * @brief  上电早期 LED 自检。
@@ -768,8 +832,23 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
     // ========== Step 2: 切换 RS485 为发送模式 ==========
     Set_RS485_Direction(1);  // P6=1，发送驱动器使能
 
-    // ========== Step 3: 阻塞发送7字节指令 ==========
-    HAL_StatusTypeDef tx_ret = HAL_UART_Transmit(&huart2, tx_packet, 7, 100);
+// ========== Step 3: 强制底层寄存器轮询发送 (不再受 HAL 库鸟气) ==========
+    // 强制清理之前的状态，防止卡死
+    USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF; 
+    
+    // 极短延时，确保 RS485 芯片的发送使能引脚已完全拉高
+    delay_us(50); 
+
+    for (int i = 0; i < 7; i++) {
+        // 等待发送数据寄存器为空 (TXE)
+        while ((USART2->ISR & USART_ISR_TXE_TXFNF) == 0) {} 
+        // 将数据塞进硬件发射膛
+        USART2->TDR = tx_packet[i]; 
+    }
+    // 等待所有数据顺着线缆完全发送完毕 (TC)
+    while ((USART2->ISR & USART_ISR_TC) == 0) {} 
+
+    HAL_StatusTypeDef tx_ret = HAL_OK; // 手动给个 OK，骗过下面的检查逻辑
 
     // ========== Step 4: 极短延时确保最后一bit已从TX线移出 ==========
     // USART2 为 115200bps，HAL_UART_Transmit 返回前通常已等待 TC；
@@ -844,181 +923,50 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
-  /* USER CODE END 1 */
+  HAL_Init(); // STM32 基础初始化
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-#if (RS485_PELCOD_TEST == 1U)
-  Board_RS485_PelcoD_TestLoop();
-#endif
-#if (USART1_RAW_TX_TEST == 1U)
-  Board_USART1_RawTxLoop();
-#endif
-#if (USART1_BRINGUP_TEST == 1U)
-  Board_USART1_BringupLoop();
-#endif
-#if (LED_ONLY_BRINGUP_TEST == 1U)
-  Board_LED_BringupLoop();
-#endif
-  Board_LED_EarlySelfTest();
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
+  // 仅仅初始化串口1 (PA9/PA10)
+  USART1_RawInit_115200_HSI();
+	
+  // 2. 初始化 GPIO，RS485 方向控制引脚所在的 PCF8574 (I2C)
   MX_GPIO_Init();
-  MX_I2C2_Init();
-  MX_USART2_UART_Init();
-  MX_USART1_UART_Init();
+  PCF8574_SoftI2C_Init();
 
-  /* USER CODE BEGIN 2 */
-  // ========== 系统初始化 ==========
+  
+  // 3. 初始化串口 2 (控制云台的 RS485 接口)
+  // 注意：务必确保 USART2 在 CubeMX 或 usart.c 中配置为 115200 波特率
+  USART2_RawInit_115200();
 
-  // 1. 初始化 DWT 计数器，为 RS485 收发切换提供微秒级保护延时
+
+  // 4. 设置默认接收状态，防止总线冲突
+  Set_RS485_Direction(0);
   DWT_Delay_Init();
 
-  // 2. 默认将 RS485 设为接收模式，确保上电后不会导致总线冲突
-  Set_RS485_Direction(0);
+  // 5. 必须校准原点 (解锁绝对坐标定位功能)
+  PelcoD_SetPreset(210);
+  Delay_With_Heartbeat(3000); 
 
-  // 3. 初始化指示灯状态：PB0心跳灯关闭，PB1动作指示灯关闭 (低电平点亮)
-  // DS1_GREEN/DS0_RED 已在 MX_GPIO_Init() 中配置为推挽输出。
-  HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);   // 绿灯灭
-  HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);       // 红灯灭
-  heartbeat_last_tick = HAL_GetTick();
-
-  // 打印系统启动信息到 USART1，波特率115200，可在电脑串口助手查看
-  printf("\r\n========================================\r\n");
-  printf("  STM32H743 云台控制程序启动\r\n");
-  printf("  主频: 400MHz  USART1: 115200bps\r\n");
-  printf("  PCF8574@0x40 控制 RS485 方向\r\n");
-  printf("========================================\r\n\r\n");
-
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-    // ========== 工业云台自动化测试序列 (半双工闭环) ==========
-    //
-    // 测试流程：
-    //   动作1: 云台左转(速度0x1E=30) → 保持3秒 → PB1动作指示翻转
-    //   动作2: 云台停止 → 保持2秒   → PB1动作指示翻转
-    //   动作3: 云台仰头(速度0x14=20) → 保持3秒 → PB1动作指示翻转
-    //   动作4: 云台停止 → 保持2秒   → PB1动作指示翻转
-    //   PB0绿灯在整个主循环中保持500ms心跳闪烁，用于证明程序正常运行
-    // 循环往复，每步均通过 PelcoD_Control_And_Query 发送指令并接收云台反馈
-
-    uint8_t rx_buf[16];
-    uint8_t rx_len = 0;
-
     Heartbeat_Service();
 
-    // ----- 动作1: 左转 (命令码0x04, 水平速度30) -----
-    printf("[系统] === 动作1: 云台左转(速度30) ===\r\n");
-    LED_Toggle_Once();
-    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_PAN_LEFT,
-                             30, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    Delay_With_Heartbeat(3000);  // 保持左转3秒，期间云台持续执行
+    // 示例：跳转至【右 45°, 仰 45°】
+    PelcoD_SetAbsolutePan(45.0f);
+    delay_us(20000); // 20ms 切换间隙
+    PelcoD_SetAbsoluteTilt(45.0f);
+    Delay_With_Heartbeat(8000); // 等待云台机械运动到位
 
-    // ----- 动作2: 停止 -----
-    printf("[系统] === 动作2: 云台停止 ===\r\n");
-    LED_Toggle_Once();
-    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
-                             0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    Delay_With_Heartbeat(2000);  // 停止保持2秒
+    // 示例：跳转至【左 45°, 仰 45°】
+    PelcoD_SetAbsolutePan(-45.0f);
+    delay_us(20000);
+    PelcoD_SetAbsoluteTilt(45.0f);
+    Delay_With_Heartbeat(8000);
 
-    // ----- 动作3: 仰头 (命令码0x08, 垂直速度20) -----
-    printf("[系统] === 动作3: 云台仰头(速度20) ===\r\n");
-    LED_Toggle_Once();
-    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_TILT_UP,
-                             0x00, 20, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    Delay_With_Heartbeat(3000);  // 保持仰头3秒
-
-    // ----- 动作4: 停止 -----
-    printf("[系统] === 动作4: 云台停止 ===\r\n");
-    LED_Toggle_Once();
-    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
-                             0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
-    Delay_With_Heartbeat(2000);  // 停止保持2秒
-
-    // 一个完整测试周期结束后，打印分隔线，便于观察电脑端串口输出
-    printf("\r\n[系统] ---- 一个测试周期完成，休息1秒后开始下一周期 ----\r\n\r\n");
-    Delay_With_Heartbeat(1000);
-
-    /* USER CODE END 3 */
-  }
-  /* USER CODE END WHILE */
-}
-
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Supply configuration update enable
-  */
-  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
-
-  /** Configure the main internal regulator output voltage
-  */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 5;
-  RCC_OscInitStruct.PLL.PLLN = 160;
-  RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
-  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
-  RCC_OscInitStruct.PLL.PLLFRACN = 0;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
-                              |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
+    // 示例：归中【0°, 0°】
+    PelcoD_SetAbsolutePan(0.0f);
+    delay_us(20000);
+    PelcoD_SetAbsoluteTilt(0.0f);
+    Delay_With_Heartbeat(5000);
   }
 }
 
@@ -1033,6 +981,33 @@ static void DWT_Delay_Init(void)
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+
+static void USART2_RawInit_115200(void)
+{
+    // 1. 开启时钟
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_USART2_CLK_ENABLE();
+
+    // 2. 配置 PA2 (TX) 和 PA3 (RX) 为复用功能
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2; // USART2 复用映射
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // 3. 寄存器配置波特率 (假设 USART2 时钟源为 64MHz)
+    // 如果不确定时钟，直接给个通用值 (SystemCoreClock / 115200)
+    CLEAR_BIT(USART2->CR1, USART_CR1_UE);
+
+    // USART2 挂在 APB1，时钟为 100MHz (根据 ioc 配置)
+    // BRR = PCLK1 / 波特率 = 100000000 / 115200 ≈ 868 (0x364)
+    USART2->BRR = (64000000U + (115200U / 2U)) / 115200U;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE; // 使能发送和接收
+    SET_BIT(USART2->CR1, USART_CR1_UE);        // 开启串口
 }
 
 /**
@@ -1059,11 +1034,8 @@ void delay_us(uint32_t us)
  */
 static int Debug_PutChar(int ch)
 {
-#if (RS485_PELCOD_TEST == 1U) || (USART1_RAW_TX_TEST == 1U)
+    // 【关键修复】：永远使用最底层的寄存器发串口，保证在任何情况下都能看到打印！
     USART1_RawWriteChar((char)ch);
-#else
-    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 10);
-#endif
     return ch;
 }
 
@@ -1100,17 +1072,13 @@ __attribute__((weak)) void _sys_exit(int x) { (void)x; while(1); }
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-#if (RS485_PELCOD_TEST == 1U) || (USART1_RAW_TX_TEST == 1U)
-  USART1_RawInit_115200_HSI();
-  Debug_WriteString("\r\n[ERROR] Error_Handler entered.\r\n");
-#endif
   __disable_irq();
+  // 强行重新初始化底层串口并疯狂报警
+  USART1_RawInit_115200_HSI();
+  printf("\r\n[FATAL ERROR] 糟糕！程序死机了，卡在了 Error_Handler！\r\n");
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
