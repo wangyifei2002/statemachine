@@ -74,7 +74,7 @@ def send_command(ser, command: str, wait_s: float) -> None:
 
 
 def interactive_loop(ser, wait_s: float) -> None:
-    print("Type commands: PAN 45, TILT -20, GOTO 45 30, GET, GET RAW, RETURN RT, LISTEN RAW, HOME, STOP, HELP")
+    print("Type commands: PAN 45, TILT -20, GOTO 45 30, BAUD 9600, GET, GET RAW, RETURN RT, LISTEN RAW, HOME, STOP, HELP")
     print("Type quit or exit to close.")
 
     while True:

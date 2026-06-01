@@ -68,6 +68,8 @@ typedef struct {
 #define RX_BUFFER_SIZE          16U
 #define RX_INTER_BYTE_TIMEOUT_MS 20U
 #define CMD_LINE_BUFFER_SIZE    64U
+#define PTZ_UART_DEFAULT_BAUDRATE 115200U
+#define PTZ_UART_CLOCK_HZ        64000000U
 
 // 云台巡检动作节拍：每 0.5 秒切换一次动作，便于肉眼确认方向
 #define PATTERN_STEP_INTERVAL_MS 500U
@@ -125,6 +127,7 @@ typedef struct {
 static uint8_t pcf8574_shadow = 0xFF;
 static uint8_t pcf8574_last_ack = 0;
 static uint32_t heartbeat_last_tick = 0;
+static uint32_t ptz_uart_baudrate = PTZ_UART_DEFAULT_BAUDRATE;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -159,6 +162,7 @@ static void Debug_WriteAngle(float angle);
 static void CommandLine_Service(void);
 static void CommandLine_Process(const char *line);
 static uint8_t CommandLine_ParseFloat(const char **cursor, float *value);
+static uint8_t CommandLine_ParseUInt(const char **cursor, uint32_t *value);
 static void CommandLine_SkipSpaces(const char **cursor);
 static uint8_t CommandLine_IsEndOrSpace(char ch);
 static void PCF8574_SoftI2C_Init(void);
@@ -185,7 +189,7 @@ static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len);
 static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len);
 static void USART2_RawDrainRx(void);
 static void USART2_RawListenAndPrint(uint32_t listen_ms);
-static void USART2_RawInit_115200(void);
+static void USART2_RawInit(uint32_t baudrate);
 void delay_us(uint32_t us);
 /* USER CODE END PFP */
 
@@ -688,6 +692,34 @@ static void CommandLine_Process(const char *line)
         return;
     }
 
+    if (strncmp(p, "BAUD", 4) == 0 && CommandLine_IsEndOrSpace(p[4]) != 0U) {
+        uint32_t baudrate;
+
+        p += 4;
+        CommandLine_SkipSpaces(&p);
+        if (*p == '\0') {
+            Debug_WriteString("BAUD ");
+            Debug_WriteUInt(ptz_uart_baudrate);
+            Debug_WriteString("\r\n");
+            return;
+        }
+
+        if (CommandLine_ParseUInt(&p, &baudrate) == 0U ||
+            (baudrate != 9600U && baudrate != 115200U)) {
+            Debug_WriteString("ERR usage: BAUD [9600|115200]\r\n");
+            return;
+        }
+
+        Set_RS485_Direction(0);
+        USART2_RawInit(baudrate);
+        Set_RS485_Direction(0);
+
+        Debug_WriteString("OK BAUD ");
+        Debug_WriteUInt(baudrate);
+        Debug_WriteString("\r\n");
+        return;
+    }
+
     if (strncmp(p, "GET", 3) == 0 && CommandLine_IsEndOrSpace(p[3]) != 0U) {
         p += 3;
         CommandLine_SkipSpaces(&p);
@@ -753,7 +785,7 @@ static void CommandLine_Process(const char *line)
     }
 
     if (strcmp(p, "HELP") == 0) {
-        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
         return;
     }
 
@@ -821,6 +853,39 @@ static uint8_t CommandLine_ParseFloat(const char **cursor, float *value)
     }
 
     *value = ((float)integer + ((float)fraction / (float)scale)) * (float)sign;
+    *cursor = p;
+    return 1U;
+}
+
+static uint8_t CommandLine_ParseUInt(const char **cursor, uint32_t *value)
+{
+    const char *p;
+    uint32_t parsed = 0U;
+    uint8_t has_digit = 0U;
+
+    if (cursor == NULL || *cursor == NULL || value == NULL) {
+        return 0U;
+    }
+
+    p = *cursor;
+    CommandLine_SkipSpaces(&p);
+
+    while (*p >= '0' && *p <= '9') {
+        has_digit = 1U;
+        parsed = (parsed * 10U) + (uint32_t)(*p - '0');
+        p++;
+    }
+
+    if (has_digit == 0U) {
+        return 0U;
+    }
+
+    CommandLine_SkipSpaces(&p);
+    if (*p != '\0') {
+        return 0U;
+    }
+
+    *value = parsed;
     *cursor = p;
     return 1U;
 }
@@ -1465,8 +1530,7 @@ int main(void)
 
   
   // 3. 初始化串口 2 (控制云台的 RS485 接口)
-  // 注意：务必确保 USART2 在 CubeMX 或 usart.c 中配置为 115200 波特率
-  USART2_RawInit_115200();
+  USART2_RawInit(PTZ_UART_DEFAULT_BAUDRATE);
 
 
   // 4. 设置默认接收状态，防止总线冲突
@@ -1478,7 +1542,7 @@ int main(void)
   Delay_With_Heartbeat(3000); 
 
   Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
-  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
 
   while (1)
   {
@@ -1501,8 +1565,14 @@ static void DWT_Delay_Init(void)
 }
 
 
-static void USART2_RawInit_115200(void)
+static void USART2_RawInit(uint32_t baudrate)
 {
+    if (baudrate == 0U) {
+        baudrate = PTZ_UART_DEFAULT_BAUDRATE;
+    }
+
+    ptz_uart_baudrate = baudrate;
+
     // 1. 开启时钟
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_USART2_CLK_ENABLE();
@@ -1516,13 +1586,10 @@ static void USART2_RawInit_115200(void)
     GPIO_InitStruct.Alternate = GPIO_AF7_USART2; // USART2 复用映射
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    // 3. 寄存器配置波特率 (假设 USART2 时钟源为 64MHz)
-    // 如果不确定时钟，直接给个通用值 (SystemCoreClock / 115200)
+    // 3. 寄存器配置波特率 (USART2 时钟源为 HSI 64MHz)
     CLEAR_BIT(USART2->CR1, USART_CR1_UE);
 
-    // USART2 挂在 APB1，时钟为 100MHz (根据 ioc 配置)
-    // BRR = PCLK1 / 波特率 = 100000000 / 115200 ≈ 868 (0x364)
-    USART2->BRR = (64000000U + (115200U / 2U)) / 115200U;
+    USART2->BRR = (PTZ_UART_CLOCK_HZ + (baudrate / 2U)) / baudrate;
     USART2->CR1 = USART_CR1_TE | USART_CR1_RE; // 使能发送和接收
     SET_BIT(USART2->CR1, USART_CR1_UE);        // 开启串口
 }
