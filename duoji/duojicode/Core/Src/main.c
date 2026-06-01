@@ -107,9 +107,12 @@ typedef struct {
 #define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
 #define PELCOD_CMD_QUERY_PAN  0x51  // 查询水平角度
 #define PELCOD_CMD_QUERY_TILT 0x53  // 查询垂直角度
+#define PELCOD_CMD_RETURN_RT  0x09  // 手册：打开或关闭角度回传--实时回传功能
 #define PELCOD_CMD_QUERY_RETURN 0x0B // 手册：打开或关闭角度回传--查询回传功能
 #define PELCOD_RESP_PAN_POS   0x59  // 水平角度回包命令码
 #define PELCOD_RESP_TILT_POS  0x5B  // 垂直角度回包命令码
+
+#define RAW_LISTEN_MS          3000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -179,6 +182,9 @@ static uint8_t PelcoD_QueryTilt(float *angle);
 static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
                                  float *angle, uint8_t normalize_signed);
 static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len);
+static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len);
+static void USART2_RawDrainRx(void);
+static void USART2_RawListenAndPrint(uint32_t listen_ms);
 static void USART2_RawInit_115200(void);
 void delay_us(uint32_t us);
 /* USER CODE END PFP */
@@ -647,6 +653,41 @@ static void CommandLine_Process(const char *line)
         return;
     }
 
+    if (strncmp(p, "RETURN", 6) == 0 && CommandLine_IsEndOrSpace(p[6]) != 0U) {
+        p += 6;
+        CommandLine_SkipSpaces(&p);
+
+        if (strcmp(p, "RT") == 0) {
+            (void)PelcoD_SetReturnMode(PELCOD_CMD_RETURN_RT, rx_buf, &rx_len);
+            Debug_WriteString("OK RETURN RT");
+        } else if (strcmp(p, "QUERY") == 0) {
+            (void)PelcoD_SetReturnMode(PELCOD_CMD_QUERY_RETURN, rx_buf, &rx_len);
+            Debug_WriteString("OK RETURN QUERY");
+        } else {
+            Debug_WriteString("ERR usage: RETURN [RT|QUERY]\r\n");
+            return;
+        }
+
+        if (rx_len > 0U) {
+            Debug_WriteString(" RX=");
+            for (uint8_t i = 0U; i < rx_len; i++) {
+                Debug_WriteHexByte(rx_buf[i]);
+                if ((uint8_t)(i + 1U) < rx_len) {
+                    USART1_RawWriteChar(' ');
+                }
+            }
+        } else {
+            Debug_WriteString(" RX=<NO DATA>");
+        }
+        Debug_WriteString("\r\n");
+        return;
+    }
+
+    if (strcmp(p, "LISTEN RAW") == 0) {
+        USART2_RawListenAndPrint(RAW_LISTEN_MS);
+        return;
+    }
+
     if (strncmp(p, "GET", 3) == 0 && CommandLine_IsEndOrSpace(p[3]) != 0U) {
         p += 3;
         CommandLine_SkipSpaces(&p);
@@ -712,7 +753,7 @@ static void CommandLine_Process(const char *line)
     }
 
     if (strcmp(p, "HELP") == 0) {
-        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], HOME, STOP\r\n");
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
         return;
     }
 
@@ -1181,10 +1222,7 @@ static uint8_t PelcoD_SendAndReceive(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
     // ========== Step 3: 强制底层寄存器轮询发送 (不再受 HAL 库鸟气) ==========
     // 强制清理之前的状态，防止卡死
-    USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
-    while ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
-        (void)USART2->RDR;
-    }
+    USART2_RawDrainRx();
     
     // 极短延时，确保 RS485 芯片的发送使能引脚已完全拉高
     delay_us(50); 
@@ -1351,6 +1389,63 @@ static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len)
                                  RX_TIMEOUT_MS, 0U);
 }
 
+static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len)
+{
+    return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, cmnd2,
+                                 0x00, 0x05, rx_buf, rx_len,
+                                 RX_TIMEOUT_MS, 0U);
+}
+
+static void USART2_RawDrainRx(void)
+{
+    USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    while ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+        (void)USART2->RDR;
+    }
+}
+
+static void USART2_RawListenAndPrint(uint32_t listen_ms)
+{
+    uint32_t start;
+    uint8_t count = 0U;
+
+    Set_RS485_Direction(0);
+    USART2_RawDrainRx();
+
+    Debug_WriteString("LISTEN RAW START ms=");
+    Debug_WriteUInt(listen_ms);
+    Debug_WriteString("\r\n");
+
+    start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start) < listen_ms) {
+        uint32_t isr = USART2->ISR;
+
+        if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_PE | USART_ISR_NE)) != 0U) {
+            USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+            Debug_WriteString("LISTEN ERR ISR=0x");
+            Debug_WriteHexByte((uint8_t)(isr & 0xFFU));
+            Debug_WriteString("\r\n");
+        }
+
+        if ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+            uint8_t byte = (uint8_t)(USART2->RDR & 0xFFU);
+            if (count == 0U) {
+                Debug_WriteString("RAW ");
+            }
+            Debug_WriteHexByte(byte);
+            USART1_RawWriteChar(' ');
+            count++;
+        }
+    }
+
+    if (count == 0U) {
+        Debug_WriteString("RAW <NO DATA>");
+    }
+    Debug_WriteString("\r\nLISTEN RAW END count=");
+    Debug_WriteUInt(count);
+    Debug_WriteString("\r\n");
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -1383,7 +1478,7 @@ int main(void)
   Delay_With_Heartbeat(3000); 
 
   Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
-  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], HOME, STOP\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
 
   while (1)
   {
