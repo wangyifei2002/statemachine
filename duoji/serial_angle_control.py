@@ -12,6 +12,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 
 DEFAULT_BAUDRATE = 115200
+DEFAULT_RESPONSE_WAIT_S = 1.0
 
 
 def require_serial():
@@ -58,7 +59,7 @@ def read_available(ser, wait_s: float = 0.2) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
-def send_command(ser, command: str) -> None:
+def send_command(ser, command: str, wait_s: float) -> None:
     command = command.strip()
     if not command:
         return
@@ -67,13 +68,13 @@ def send_command(ser, command: str) -> None:
     ser.flush()
     print(f"> {command}")
 
-    response = read_available(ser)
+    response = read_available(ser, wait_s=wait_s)
     if response:
         print(response, end="" if response.endswith("\n") else "\n")
 
 
-def interactive_loop(ser) -> None:
-    print("Type commands: PAN 45, TILT -20, GOTO 45 30, GET, GET PAN, HOME, STOP, HELP")
+def interactive_loop(ser, wait_s: float) -> None:
+    print("Type commands: PAN 45, TILT -20, GOTO 45 30, GET, GET RAW, GET PAN, HOME, STOP, HELP")
     print("Type quit or exit to close.")
 
     while True:
@@ -86,7 +87,7 @@ def interactive_loop(ser) -> None:
         if command.strip().lower() in {"quit", "exit"}:
             return
 
-        send_command(ser, command)
+        send_command(ser, command, wait_s)
 
 
 def main(argv: list[str]) -> int:
@@ -112,6 +113,13 @@ def main(argv: list[str]) -> int:
         help="Command to send. Can be used multiple times, e.g. -c 'PAN 45'.",
     )
     parser.add_argument(
+        "-w",
+        "--wait",
+        type=float,
+        default=DEFAULT_RESPONSE_WAIT_S,
+        help=f"Seconds to wait for each response, default {DEFAULT_RESPONSE_WAIT_S}.",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List available serial ports and exit.",
@@ -135,10 +143,10 @@ def main(argv: list[str]) -> int:
 
         if args.command:
             for command in args.command:
-                send_command(ser, command)
+                send_command(ser, command, args.wait)
                 time.sleep(0.1)
         else:
-            interactive_loop(ser)
+            interactive_loop(ser, args.wait)
 
     return 0
 

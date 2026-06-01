@@ -107,6 +107,7 @@ typedef struct {
 #define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
 #define PELCOD_CMD_QUERY_PAN  0x51  // 查询水平角度
 #define PELCOD_CMD_QUERY_TILT 0x53  // 查询垂直角度
+#define PELCOD_CMD_QUERY_RETURN 0x0B // 手册：打开或关闭角度回传--查询回传功能
 #define PELCOD_RESP_PAN_POS   0x59  // 水平角度回包命令码
 #define PELCOD_RESP_TILT_POS  0x5B  // 垂直角度回包命令码
 /* USER CODE END PD */
@@ -177,6 +178,7 @@ static uint8_t PelcoD_QueryPan(float *angle);
 static uint8_t PelcoD_QueryTilt(float *angle);
 static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
                                  float *angle, uint8_t normalize_signed);
+static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len);
 static void USART2_RawInit_115200(void);
 void delay_us(uint32_t us);
 /* USER CODE END PFP */
@@ -580,7 +582,7 @@ static void CommandLine_Service(void)
  *         PAN 45
  *         TILT -20
  *         GOTO 45 30
- *         GET / GET PAN / GET TILT
+ *         GET / GET RAW / GET PAN / GET TILT
  *         HOME
  *         STOP
  */
@@ -649,6 +651,28 @@ static void CommandLine_Process(const char *line)
         p += 3;
         CommandLine_SkipSpaces(&p);
 
+        if (strcmp(p, "RAW") == 0) {
+            if (PelcoD_QueryReturnRaw(rx_buf, &rx_len) == 0U) {
+                Debug_WriteString("ERR query raw\r\n");
+                return;
+            }
+
+            Debug_WriteString("RAW");
+            if (rx_len == 0U) {
+                Debug_WriteString(" <NO DATA>");
+            } else {
+                Debug_WriteString(" ");
+                for (uint8_t i = 0U; i < rx_len; i++) {
+                    Debug_WriteHexByte(rx_buf[i]);
+                    if ((uint8_t)(i + 1U) < rx_len) {
+                        USART1_RawWriteChar(' ');
+                    }
+                }
+            }
+            Debug_WriteString("\r\n");
+            return;
+        }
+
         if (*p == '\0' || strcmp(p, "PAN") == 0) {
             if (PelcoD_QueryPan(&pan) == 0U) {
                 Debug_WriteString("ERR query pan\r\n");
@@ -683,12 +707,12 @@ static void CommandLine_Process(const char *line)
             return;
         }
 
-        Debug_WriteString("ERR usage: GET [PAN|TILT]\r\n");
+        Debug_WriteString("ERR usage: GET [RAW|PAN|TILT]\r\n");
         return;
     }
 
     if (strcmp(p, "HELP") == 0) {
-        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [PAN|TILT], HOME, STOP\r\n");
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], HOME, STOP\r\n");
         return;
     }
 
@@ -1312,6 +1336,21 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
     return 1U;
 }
 
+static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len)
+{
+    /*
+     * Device manual section 6.3:
+     *   FF 01 00 0B 00 05 11
+     *   "打开或关闭角度回传--查询回传功能"
+     *
+     * The manual does not document the response layout, so expose the raw frame
+     * first. Once the real frame is known, parse it into angles.
+     */
+    return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_QUERY_RETURN,
+                                 0x00, 0x05, rx_buf, rx_len,
+                                 RX_TIMEOUT_MS, 0U);
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -1344,7 +1383,7 @@ int main(void)
   Delay_With_Heartbeat(3000); 
 
   Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
-  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [PAN|TILT], HOME, STOP\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [RAW|PAN|TILT], HOME, STOP\r\n");
 
   while (1)
   {
