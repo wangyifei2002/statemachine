@@ -7,6 +7,9 @@ import argparse
 import sys
 import time
 
+# Force unbuffered output so output appears immediately in terminals
+sys.stdout.reconfigure(line_buffering=True)
+
 
 DEFAULT_BAUDRATE = 115200
 
