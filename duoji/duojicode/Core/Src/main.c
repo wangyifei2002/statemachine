@@ -105,6 +105,10 @@ typedef struct {
 // ========== 新增绝对角度定位命令码 ==========
 #define PELCOD_CMD_SET_PAN   0x4B  // 绝对水平定位操作码
 #define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
+#define PELCOD_CMD_QUERY_PAN  0x51  // 查询水平角度
+#define PELCOD_CMD_QUERY_TILT 0x53  // 查询垂直角度
+#define PELCOD_RESP_PAN_POS   0x59  // 水平角度回包命令码
+#define PELCOD_RESP_TILT_POS  0x5B  // 垂直角度回包命令码
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -145,7 +149,9 @@ static void USART1_RawWriteUInt(uint32_t value);
 static uint8_t USART1_RawReadCharNonBlocking(char *ch);
 static void Debug_WriteString(const char *s);
 static void Debug_WriteUInt(uint32_t value);
+static void Debug_WriteInt(int32_t value);
 static void Debug_WriteHexByte(uint8_t value);
+static void Debug_WriteAngle(float angle);
 static void CommandLine_Service(void);
 static void CommandLine_Process(const char *line);
 static uint8_t CommandLine_ParseFloat(const char **cursor, float *value);
@@ -163,6 +169,14 @@ static uint8_t SoftI2C_WriteByte(uint8_t data);
 static void Board_DelayMs(uint32_t delay_ms);
 static void DWT_Delay_Init(void);
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
+static uint8_t PelcoD_SendAndReceive(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                                     uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                                     uint8_t *rx_len, uint16_t timeout_ms,
+                                     uint8_t print_debug);
+static uint8_t PelcoD_QueryPan(float *angle);
+static uint8_t PelcoD_QueryTilt(float *angle);
+static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+                                 float *angle, uint8_t normalize_signed);
 static void USART2_RawInit_115200(void);
 void delay_us(uint32_t us);
 /* USER CODE END PFP */
@@ -479,12 +493,42 @@ static void Debug_WriteUInt(uint32_t value)
     USART1_RawWriteUInt(value);
 }
 
+static void Debug_WriteInt(int32_t value)
+{
+    if (value < 0) {
+        USART1_RawWriteChar('-');
+        Debug_WriteUInt((uint32_t)(-value));
+    } else {
+        Debug_WriteUInt((uint32_t)value);
+    }
+}
+
 static void Debug_WriteHexByte(uint8_t value)
 {
     static const char hex[] = "0123456789ABCDEF";
 
     USART1_RawWriteChar(hex[(value >> 4) & 0x0FU]);
     USART1_RawWriteChar(hex[value & 0x0FU]);
+}
+
+static void Debug_WriteAngle(float angle)
+{
+    int32_t scaled = (int32_t)((angle * 100.0f) + ((angle >= 0.0f) ? 0.5f : -0.5f));
+    int32_t integer;
+    int32_t fraction;
+
+    integer = scaled / 100;
+    fraction = scaled % 100;
+    if (fraction < 0) {
+        fraction = -fraction;
+    }
+
+    Debug_WriteInt(integer);
+    USART1_RawWriteChar('.');
+    if (fraction < 10) {
+        USART1_RawWriteChar('0');
+    }
+    Debug_WriteUInt((uint32_t)fraction);
 }
 
 /**
@@ -536,6 +580,7 @@ static void CommandLine_Service(void)
  *         PAN 45
  *         TILT -20
  *         GOTO 45 30
+ *         GET / GET PAN / GET TILT
  *         HOME
  *         STOP
  */
@@ -600,8 +645,50 @@ static void CommandLine_Process(const char *line)
         return;
     }
 
+    if (strncmp(p, "GET", 3) == 0 && CommandLine_IsEndOrSpace(p[3]) != 0U) {
+        p += 3;
+        CommandLine_SkipSpaces(&p);
+
+        if (*p == '\0' || strcmp(p, "PAN") == 0) {
+            if (PelcoD_QueryPan(&pan) == 0U) {
+                Debug_WriteString("ERR query pan\r\n");
+                return;
+            }
+
+            Debug_WriteString("ANGLE PAN=");
+            Debug_WriteAngle(pan);
+
+            if (*p != '\0') {
+                Debug_WriteString("\r\n");
+                return;
+            }
+        }
+
+        if (*p == '\0' || strcmp(p, "TILT") == 0) {
+            if (PelcoD_QueryTilt(&tilt) == 0U) {
+                if (*p == '\0') {
+                    Debug_WriteString("\r\n");
+                }
+                Debug_WriteString("ERR query tilt\r\n");
+                return;
+            }
+
+            if (*p != '\0') {
+                Debug_WriteString("ANGLE TILT=");
+            } else {
+                Debug_WriteString(" TILT=");
+            }
+            Debug_WriteAngle(tilt);
+            Debug_WriteString("\r\n");
+            return;
+        }
+
+        Debug_WriteString("ERR usage: GET [PAN|TILT]\r\n");
+        return;
+    }
+
     if (strcmp(p, "HELP") == 0) {
-        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, HOME, STOP\r\n");
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [PAN|TILT], HOME, STOP\r\n");
         return;
     }
 
@@ -983,9 +1070,8 @@ static void Delay_With_Heartbeat(uint32_t delay_ms)
 }
 
 /**
- * @brief  使用 HAL_UART_Receive 带超时读取一帧可能长度不固定的云台回传。
- * @note   第一字节使用业务超时，后续字节使用较短字节间超时。
- *         这样不会固定等待16字节，也不会把 Pelco-D 帧头 0xFF 误判为结束符。
+ * @brief  使用 USART2 raw 轮询读取一帧可能长度不固定的云台回传。
+ * @note   USART2 当前由寄存器直接初始化，不能依赖 huart2 的 HAL 状态。
  */
 static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms)
 {
@@ -997,10 +1083,26 @@ static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t
 
     while (len < max_len) {
         uint16_t timeout = (len == 0U) ? first_byte_timeout_ms : RX_INTER_BYTE_TIMEOUT_MS;
-        if (HAL_UART_Receive(&huart2, &rx_buf[len], 1, timeout) != HAL_OK) {
+        uint32_t start = HAL_GetTick();
+        uint8_t received = 0U;
+
+        while ((uint32_t)(HAL_GetTick() - start) < timeout) {
+            uint32_t isr = USART2->ISR;
+
+            if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_PE | USART_ISR_NE)) != 0U) {
+                USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+            }
+
+            if ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+                rx_buf[len++] = (uint8_t)(USART2->RDR & 0xFFU);
+                received = 1U;
+                break;
+            }
+        }
+
+        if (received == 0U) {
             break;
         }
-        len++;
     }
 
     return len;
@@ -1015,7 +1117,7 @@ static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t
  *   3. 通过 USART2 阻塞发送7字节
  *   4. 延时极短时间确保最后一个bit离开发送器
  *   5. 立即切换 RS485 为接收模式
- *   6. 调用 HAL_UART_Receive 带超时等待云台回传
+ *   6. raw 轮询 USART2 等待云台回传
  *   7. 根据结果打印发送提示、回传数据或超时提示
  *
  * @param  addr:      云台设备地址 (默认0x01)
@@ -1027,9 +1129,10 @@ static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t
  * @param  rx_len:   接收到的数据长度指针，用于输出实际接收字节数
  * @param  timeout_ms: 接收超时时间 (毫秒)
  */
-void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
-                              uint8_t data1, uint8_t data2, uint8_t *rx_buf,
-                              uint8_t *rx_len, uint16_t timeout_ms)
+static uint8_t PelcoD_SendAndReceive(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                                     uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                                     uint8_t *rx_len, uint16_t timeout_ms,
+                                     uint8_t print_debug)
 {
     uint8_t tx_packet[7];
     uint8_t rx_temp[RX_BUFFER_SIZE] = {0};
@@ -1052,9 +1155,12 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
     // ========== Step 2: 切换 RS485 为发送模式 ==========
     Set_RS485_Direction(1);  // P6=1，发送驱动器使能
 
-// ========== Step 3: 强制底层寄存器轮询发送 (不再受 HAL 库鸟气) ==========
+    // ========== Step 3: 强制底层寄存器轮询发送 (不再受 HAL 库鸟气) ==========
     // 强制清理之前的状态，防止卡死
-    USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF; 
+    USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    while ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+        (void)USART2->RDR;
+    }
     
     // 极短延时，确保 RS485 芯片的发送使能引脚已完全拉高
     delay_us(50); 
@@ -1087,52 +1193,123 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
     // ========== Step 7: 接收完成后才打印提示 (避免拖慢485方向切换和接收起始时刻) ==========
     if (tx_ret != HAL_OK) {
-        Debug_WriteString("[PC] USART2 transmit failed, HAL status=");
-        Debug_WriteUInt((uint32_t)tx_ret);
-        Debug_WriteString("\r\n");
-        PrintHexFrame("[TX]", tx_packet, 7);
-        return;
+        if (print_debug != 0U) {
+            Debug_WriteString("[PC] USART2 transmit failed, HAL status=");
+            Debug_WriteUInt((uint32_t)tx_ret);
+            Debug_WriteString("\r\n");
+            PrintHexFrame("[TX]", tx_packet, 7);
+        }
+        return 0U;
     }
 
-    Debug_WriteString("[PC] sent command: ");
-    if (cmnd2 == PELCOD_CMD_STOP) {
-        Debug_WriteString("stop\r\n");
-    } else {
-        Debug_WriteString("move");
-        if ((cmnd2 & PELCOD_CMD_PAN_LEFT) != 0U) {
-            Debug_WriteString(" left");
+    if (print_debug != 0U) {
+        Debug_WriteString("[PC] sent command: ");
+        if (cmnd2 == PELCOD_CMD_STOP) {
+            Debug_WriteString("stop\r\n");
+        } else {
+            Debug_WriteString("move");
+            if ((cmnd2 & PELCOD_CMD_PAN_LEFT) != 0U) {
+                Debug_WriteString(" left");
+            }
+            if ((cmnd2 & PELCOD_CMD_PAN_RIGHT) != 0U) {
+                Debug_WriteString(" right");
+            }
+            if ((cmnd2 & PELCOD_CMD_TILT_UP) != 0U) {
+                Debug_WriteString(" up");
+            }
+            if ((cmnd2 & PELCOD_CMD_TILT_DOWN) != 0U) {
+                Debug_WriteString(" down");
+            }
+            Debug_WriteString(", pan_speed=");
+            Debug_WriteUInt(data1);
+            Debug_WriteString(", tilt_speed=");
+            Debug_WriteUInt(data2);
+            Debug_WriteString("\r\n");
         }
-        if ((cmnd2 & PELCOD_CMD_PAN_RIGHT) != 0U) {
-            Debug_WriteString(" right");
-        }
-        if ((cmnd2 & PELCOD_CMD_TILT_UP) != 0U) {
-            Debug_WriteString(" up");
-        }
-        if ((cmnd2 & PELCOD_CMD_TILT_DOWN) != 0U) {
-            Debug_WriteString(" down");
-        }
-        Debug_WriteString(", pan_speed=");
-        Debug_WriteUInt(data1);
-        Debug_WriteString(", tilt_speed=");
-        Debug_WriteUInt(data2);
-        Debug_WriteString("\r\n");
+        PrintHexFrame("[TX]", tx_packet, 7);
     }
-    PrintHexFrame("[TX]", tx_packet, 7);
 
     if (actual_len > 0U) {
         if (rx_buf != NULL && rx_len != NULL) {
             memcpy(rx_buf, rx_temp, actual_len);
             *rx_len = actual_len;
         }
-        Debug_WriteString("[PC] received response, len=");
-        Debug_WriteUInt(actual_len);
-        Debug_WriteString("\r\n");
-        PrintHexFrame("[RX]", rx_temp, actual_len);
+        if (print_debug != 0U) {
+            Debug_WriteString("[PC] received response, len=");
+            Debug_WriteUInt(actual_len);
+            Debug_WriteString("\r\n");
+            PrintHexFrame("[RX]", rx_temp, actual_len);
+        }
+        return 1U;
     } else {
-        Debug_WriteString("[PC] response timeout, wait_ms=");
-        Debug_WriteUInt(timeout_ms);
-        Debug_WriteString("\r\n");
+        if (print_debug != 0U) {
+            Debug_WriteString("[PC] response timeout, wait_ms=");
+            Debug_WriteUInt(timeout_ms);
+            Debug_WriteString("\r\n");
+        }
+        return 0U;
     }
+}
+
+void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                              uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                              uint8_t *rx_len, uint16_t timeout_ms)
+{
+    (void)PelcoD_SendAndReceive(addr, cmnd1, cmnd2, data1, data2,
+                                rx_buf, rx_len, timeout_ms, 1U);
+}
+
+static uint8_t PelcoD_QueryPan(float *angle)
+{
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS, angle, 0U);
+}
+
+static uint8_t PelcoD_QueryTilt(float *angle)
+{
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS, angle, 1U);
+}
+
+static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+                                 float *angle, uint8_t normalize_signed)
+{
+    uint8_t rx_buf[RX_BUFFER_SIZE] = {0};
+    uint8_t rx_len = 0U;
+    uint16_t raw;
+    float parsed_angle;
+
+    if (angle == NULL) {
+        return 0U;
+    }
+
+    if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, query_cmd,
+                              0x00, 0x00, rx_buf, &rx_len,
+                              RX_TIMEOUT_MS, 0U) == 0U) {
+        return 0U;
+    }
+
+    if (rx_len < 7U) {
+        return 0U;
+    }
+
+    if (rx_buf[0] != PELCOD_SYNC_BYTE ||
+        rx_buf[1] != PTZ_ADDR_DEFAULT ||
+        rx_buf[3] != response_cmd) {
+        return 0U;
+    }
+
+    if (PelcoD_CalcChecksum(&rx_buf[1], 5) != rx_buf[6]) {
+        return 0U;
+    }
+
+    raw = ((uint16_t)rx_buf[4] << 8) | rx_buf[5];
+    parsed_angle = (float)raw / 100.0f;
+
+    if (normalize_signed != 0U && parsed_angle > 180.0f) {
+        parsed_angle -= 360.0f;
+    }
+
+    *angle = parsed_angle;
+    return 1U;
 }
 
 /* USER CODE END 0 */
@@ -1167,7 +1344,7 @@ int main(void)
   Delay_With_Heartbeat(3000); 
 
   Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
-  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, HOME, STOP\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, GET [PAN|TILT], HOME, STOP\r\n");
 
   while (1)
   {
