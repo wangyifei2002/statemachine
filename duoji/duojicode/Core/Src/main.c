@@ -67,6 +67,7 @@ typedef struct {
 #define RX_TIMEOUT_MS           200
 #define RX_BUFFER_SIZE          16U
 #define RX_INTER_BYTE_TIMEOUT_MS 20U
+#define CMD_LINE_BUFFER_SIZE    64U
 
 // 云台巡检动作节拍：每 0.5 秒切换一次动作，便于肉眼确认方向
 #define PATTERN_STEP_INTERVAL_MS 500U
@@ -141,9 +142,15 @@ static void USART1_RawInit_115200_HSI(void);
 static void USART1_RawWriteChar(char ch);
 static void USART1_RawWriteString(const char *s);
 static void USART1_RawWriteUInt(uint32_t value);
+static uint8_t USART1_RawReadCharNonBlocking(char *ch);
 static void Debug_WriteString(const char *s);
 static void Debug_WriteUInt(uint32_t value);
 static void Debug_WriteHexByte(uint8_t value);
+static void CommandLine_Service(void);
+static void CommandLine_Process(const char *line);
+static uint8_t CommandLine_ParseFloat(const char **cursor, float *value);
+static void CommandLine_SkipSpaces(const char **cursor);
+static uint8_t CommandLine_IsEndOrSpace(char ch);
 static void PCF8574_SoftI2C_Init(void);
 static uint8_t PCF8574_WriteByte(uint8_t data);
 static void SoftI2C_SDA_Output(void);
@@ -349,8 +356,9 @@ static void Board_USART1_RawTxLoop(void)
 }
 
 /**
- * @brief  用寄存器直接初始化 USART1 TX。
- * @note   目标是排除 HAL UART、系统 PLL、其它外设初始化带来的干扰。
+ * @brief  用寄存器直接初始化 USART1 TX/RX。
+ * @note   PA9=TX 输出调试信息，PA10=RX 接收电脑/Python 发来的文本命令。
+ *         目标是排除 HAL UART、系统 PLL、其它外设初始化带来的干扰。
  */
 static void USART1_RawInit_115200_HSI(void)
 {
@@ -369,9 +377,9 @@ static void USART1_RawInit_115200_HSI(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_USART1_CLK_ENABLE();
 
-    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -383,7 +391,8 @@ static void USART1_RawInit_115200_HSI(void)
     USART1->CR3 = 0U;
     USART1->PRESC = 0U;
     USART1->BRR = (USART1_RAW_CLOCK_HZ + (USART1_RAW_BAUDRATE / 2U)) / USART1_RAW_BAUDRATE;
-    USART1->CR1 = USART_CR1_TE;
+    USART1->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE;
     SET_BIT(USART1->CR1, USART_CR1_UE);
 }
 
@@ -396,6 +405,31 @@ static void USART1_RawWriteChar(char ch)
         /* wait for TX FIFO not full */
     }
     USART1->TDR = (uint8_t)ch;
+}
+
+/**
+ * @brief  非阻塞读取 USART1 单个字符。
+ * @return 1=读到字符，0=当前没有新字符。
+ */
+static uint8_t USART1_RawReadCharNonBlocking(char *ch)
+{
+    uint32_t isr = USART1->ISR;
+
+    if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_PE | USART_ISR_NE)) != 0U) {
+        USART1->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    }
+
+    if ((USART1->ISR & USART_ISR_RXNE_RXFNE) == 0U) {
+        return 0U;
+    }
+
+    if (ch != NULL) {
+        *ch = (char)(USART1->RDR & 0xFFU);
+    } else {
+        (void)USART1->RDR;
+    }
+
+    return 1U;
 }
 
 /**
@@ -451,6 +485,192 @@ static void Debug_WriteHexByte(uint8_t value)
 
     USART1_RawWriteChar(hex[(value >> 4) & 0x0FU]);
     USART1_RawWriteChar(hex[value & 0x0FU]);
+}
+
+/**
+ * @brief  从 USART1 收集一行命令。Python 端每条命令以 \n 结尾。
+ */
+static void CommandLine_Service(void)
+{
+    static char line[CMD_LINE_BUFFER_SIZE];
+    static uint8_t len = 0U;
+    char ch;
+
+    while (USART1_RawReadCharNonBlocking(&ch) != 0U) {
+        if (ch == '\r') {
+            continue;
+        }
+
+        if (ch == '\n') {
+            line[len] = '\0';
+            if (len > 0U) {
+                CommandLine_Process(line);
+            }
+            len = 0U;
+            continue;
+        }
+
+        if (ch == '\b' || ch == 0x7F) {
+            if (len > 0U) {
+                len--;
+            }
+            continue;
+        }
+
+        if (ch < 32 || ch > 126) {
+            continue;
+        }
+
+        if (len < (CMD_LINE_BUFFER_SIZE - 1U)) {
+            line[len++] = ch;
+        } else {
+            len = 0U;
+            Debug_WriteString("ERR line too long\r\n");
+        }
+    }
+}
+
+/**
+ * @brief  解析 Python 发来的文本命令。
+ * @note   支持：
+ *         PAN 45
+ *         TILT -20
+ *         GOTO 45 30
+ *         HOME
+ *         STOP
+ */
+static void CommandLine_Process(const char *line)
+{
+    const char *p = line;
+    float pan;
+    float tilt;
+    uint8_t rx_buf[RX_BUFFER_SIZE];
+    uint8_t rx_len = 0U;
+
+    CommandLine_SkipSpaces(&p);
+
+    if (strncmp(p, "PAN", 3) == 0 && CommandLine_IsEndOrSpace(p[3]) != 0U) {
+        p += 3;
+        if (CommandLine_ParseFloat(&p, &pan) == 0U) {
+            Debug_WriteString("ERR usage: PAN <angle>\r\n");
+            return;
+        }
+        PelcoD_SetAbsolutePan(pan);
+        Debug_WriteString("OK PAN\r\n");
+        return;
+    }
+
+    if (strncmp(p, "TILT", 4) == 0 && CommandLine_IsEndOrSpace(p[4]) != 0U) {
+        p += 4;
+        if (CommandLine_ParseFloat(&p, &tilt) == 0U) {
+            Debug_WriteString("ERR usage: TILT <angle>\r\n");
+            return;
+        }
+        PelcoD_SetAbsoluteTilt(tilt);
+        Debug_WriteString("OK TILT\r\n");
+        return;
+    }
+
+    if (strncmp(p, "GOTO", 4) == 0 && CommandLine_IsEndOrSpace(p[4]) != 0U) {
+        p += 4;
+        if (CommandLine_ParseFloat(&p, &pan) == 0U ||
+            CommandLine_ParseFloat(&p, &tilt) == 0U) {
+            Debug_WriteString("ERR usage: GOTO <pan> <tilt>\r\n");
+            return;
+        }
+        PelcoD_SetAbsolutePan(pan);
+        delay_us(20000);
+        PelcoD_SetAbsoluteTilt(tilt);
+        Debug_WriteString("OK GOTO\r\n");
+        return;
+    }
+
+    if (strcmp(p, "HOME") == 0) {
+        PelcoD_SetAbsolutePan(0.0f);
+        delay_us(20000);
+        PelcoD_SetAbsoluteTilt(0.0f);
+        Debug_WriteString("OK HOME\r\n");
+        return;
+    }
+
+    if (strcmp(p, "STOP") == 0) {
+        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
+                                 0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
+        Debug_WriteString("OK STOP\r\n");
+        return;
+    }
+
+    if (strcmp(p, "HELP") == 0) {
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, HOME, STOP\r\n");
+        return;
+    }
+
+    Debug_WriteString("ERR unknown command\r\n");
+}
+
+static void CommandLine_SkipSpaces(const char **cursor)
+{
+    while (cursor != NULL && *cursor != NULL && (**cursor == ' ' || **cursor == '\t')) {
+        (*cursor)++;
+    }
+}
+
+static uint8_t CommandLine_IsEndOrSpace(char ch)
+{
+    return (uint8_t)(ch == '\0' || ch == ' ' || ch == '\t');
+}
+
+/**
+ * @brief  轻量解析浮点数，避免依赖 scanf 的浮点解析开关。
+ */
+static uint8_t CommandLine_ParseFloat(const char **cursor, float *value)
+{
+    const char *p;
+    int sign = 1;
+    uint32_t integer = 0U;
+    uint32_t fraction = 0U;
+    uint32_t scale = 1U;
+    uint8_t has_digit = 0U;
+
+    if (cursor == NULL || *cursor == NULL || value == NULL) {
+        return 0U;
+    }
+
+    p = *cursor;
+    CommandLine_SkipSpaces(&p);
+
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    } else if (*p == '+') {
+        p++;
+    }
+
+    while (*p >= '0' && *p <= '9') {
+        has_digit = 1U;
+        integer = (integer * 10U) + (uint32_t)(*p - '0');
+        p++;
+    }
+
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            has_digit = 1U;
+            if (scale < 1000000U) {
+                fraction = (fraction * 10U) + (uint32_t)(*p - '0');
+                scale *= 10U;
+            }
+            p++;
+        }
+    }
+
+    if (has_digit == 0U) {
+        return 0U;
+    }
+
+    *value = ((float)integer + ((float)fraction / (float)scale)) * (float)sign;
+    *cursor = p;
+    return 1U;
 }
 
 /**
@@ -946,27 +1166,13 @@ int main(void)
   PelcoD_SetPreset(210);
   Delay_With_Heartbeat(3000); 
 
+  Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, HOME, STOP\r\n");
+
   while (1)
   {
     Heartbeat_Service();
-
-    // 示例：跳转至【右 45°, 仰 45°】
-    PelcoD_SetAbsolutePan(45.0f);
-    delay_us(20000); // 20ms 切换间隙
-    PelcoD_SetAbsoluteTilt(45.0f);
-    Delay_With_Heartbeat(8000); // 等待云台机械运动到位
-
-    // 示例：跳转至【左 45°, 仰 45°】
-    PelcoD_SetAbsolutePan(-45.0f);
-    delay_us(20000);
-    PelcoD_SetAbsoluteTilt(45.0f);
-    Delay_With_Heartbeat(8000);
-
-    // 示例：归中【0°, 0°】
-    PelcoD_SetAbsolutePan(0.0f);
-    delay_us(20000);
-    PelcoD_SetAbsoluteTilt(0.0f);
-    Delay_With_Heartbeat(5000);
+    CommandLine_Service();
   }
 }
 
