@@ -107,12 +107,12 @@ typedef struct {
 // ========== 新增绝对角度定位命令码 ==========
 #define PELCOD_CMD_SET_PAN   0x4B  // 绝对水平定位操作码
 #define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
-#define PELCOD_CMD_QUERY_PAN  0x51  // 查询水平角度
-#define PELCOD_CMD_QUERY_TILT 0x53  // 查询垂直角度
+#define PELCOD_CMD_QUERY_PAN 0x30  // 手册：查询水平坐标位置 (FF 01 30 30 00 00 SS)
+#define PELCOD_CMD_QUERY_TILT 0x40 // 手册：查询垂直坐标位置 (FF 01 30 40 00 00 SS)
 #define PELCOD_CMD_RETURN_RT  0x09  // 手册：打开或关闭角度回传--实时回传功能
 #define PELCOD_CMD_QUERY_RETURN 0x0B // 手册：打开或关闭角度回传--查询回传功能
-#define PELCOD_RESP_PAN_POS   0x59  // 水平角度回包命令码
-#define PELCOD_RESP_TILT_POS  0x5B  // 垂直角度回包命令码
+#define PELCOD_RESP_PAN_POS   0x3B  // 手册：云台回复水平当前位置
+#define PELCOD_RESP_TILT_POS  0x4B  // 手册：云台回复垂直当前位置
 
 #define RAW_LISTEN_MS          3000U
 /* USER CODE END PD */
@@ -183,7 +183,7 @@ static uint8_t PelcoD_SendAndReceive(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
                                      uint8_t print_debug);
 static uint8_t PelcoD_QueryPan(float *angle);
 static uint8_t PelcoD_QueryTilt(float *angle);
-static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+static uint8_t PelcoD_QueryAngle(uint8_t cmnd1, uint8_t query_cmd, uint8_t response_cmd,
                                  float *angle, uint8_t normalize_signed);
 static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len);
 static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len);
@@ -1388,15 +1388,15 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
 static uint8_t PelcoD_QueryPan(float *angle)
 {
-    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS, angle, 0U);
+    return PelcoD_QueryAngle(0x30, PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS, angle, 0U);
 }
 
 static uint8_t PelcoD_QueryTilt(float *angle)
 {
-    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS, angle, 1U);
+    return PelcoD_QueryAngle(0x30, PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS, angle, 1U);
 }
 
-static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+static uint8_t PelcoD_QueryAngle(uint8_t cmnd1, uint8_t query_cmd, uint8_t response_cmd,
                                  float *angle, uint8_t normalize_signed)
 {
     uint8_t rx_buf[RX_BUFFER_SIZE] = {0};
@@ -1408,7 +1408,7 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
         return 0U;
     }
 
-    if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, query_cmd,
+    if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, cmnd1, query_cmd,
                               0x00, 0x00, rx_buf, &rx_len,
                               RX_TIMEOUT_MS, 0U) == 0U) {
         return 0U;
