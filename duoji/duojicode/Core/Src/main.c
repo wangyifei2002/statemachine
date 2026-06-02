@@ -65,6 +65,7 @@ typedef struct {
 
 // 接收超时时间 (ms)
 #define RX_TIMEOUT_MS           200
+#define QUERY_RX_TIMEOUT_MS     1000U
 #define RX_BUFFER_SIZE          16U
 #define RX_INTER_BYTE_TIMEOUT_MS 20U
 #define CMD_LINE_BUFFER_SIZE    64U
@@ -107,12 +108,13 @@ typedef struct {
 // ========== 新增绝对角度定位命令码 ==========
 #define PELCOD_CMD_SET_PAN   0x4B  // 绝对水平定位操作码
 #define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
-#define PELCOD_CMD_QUERY_PAN  0x51  // 查询水平角度
-#define PELCOD_CMD_QUERY_TILT 0x53  // 查询垂直角度
+#define PELCOD_EXT_CMND1      0x30  // JSA-EFPTZDUSO4S扩展指令
+#define PELCOD_CMD_QUERY_PAN  0x30  // 扩展指令：查询水平坐标位置
+#define PELCOD_CMD_QUERY_TILT 0x40  // 扩展指令：查询垂直坐标位置
 #define PELCOD_CMD_RETURN_RT  0x09  // 手册：打开或关闭角度回传--实时回传功能
 #define PELCOD_CMD_QUERY_RETURN 0x0B // 手册：打开或关闭角度回传--查询回传功能
-#define PELCOD_RESP_PAN_POS   0x59  // 水平角度回包命令码
-#define PELCOD_RESP_TILT_POS  0x5B  // 垂直角度回包命令码
+#define PELCOD_RESP_PAN_POS_BASE  0x30  // 扩展指令：云台返回水平坐标位置，高半字节
+#define PELCOD_RESP_TILT_POS_BASE 0x40  // 扩展指令：云台返回垂直坐标位置，高半字节
 
 #define RAW_LISTEN_MS          3000U
 /* USER CODE END PD */
@@ -1388,29 +1390,29 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
 static uint8_t PelcoD_QueryPan(float *angle)
 {
-    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS, angle, 0U);
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS_BASE, angle, 0U);
 }
 
 static uint8_t PelcoD_QueryTilt(float *angle)
 {
-    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS, angle, 1U);
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS_BASE, angle, 1U);
 }
 
-static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_base,
                                  float *angle, uint8_t normalize_signed)
 {
     uint8_t rx_buf[RX_BUFFER_SIZE] = {0};
     uint8_t rx_len = 0U;
-    uint16_t raw;
+    uint32_t raw;
     float parsed_angle;
 
     if (angle == NULL) {
         return 0U;
     }
 
-    if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, query_cmd,
+    if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, query_cmd,
                               0x00, 0x00, rx_buf, &rx_len,
-                              RX_TIMEOUT_MS, 0U) == 0U) {
+                              QUERY_RX_TIMEOUT_MS, 0U) == 0U) {
         return 0U;
     }
 
@@ -1420,7 +1422,8 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
 
     if (rx_buf[0] != PELCOD_SYNC_BYTE ||
         rx_buf[1] != PTZ_ADDR_DEFAULT ||
-        rx_buf[3] != response_cmd) {
+        rx_buf[2] != PELCOD_EXT_CMND1 ||
+        (rx_buf[3] & 0xF0U) != response_base) {
         return 0U;
     }
 
@@ -1428,10 +1431,12 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
         return 0U;
     }
 
-    raw = ((uint16_t)rx_buf[4] << 8) | rx_buf[5];
-    parsed_angle = (float)raw / 100.0f;
+    raw = (((uint32_t)rx_buf[3] & 0x0FU) << 16) |
+          ((uint32_t)rx_buf[4] << 8) |
+          (uint32_t)rx_buf[5];
+    parsed_angle = (float)raw / 1000.0f;
 
-    if (normalize_signed != 0U && parsed_angle > 180.0f) {
+    if (normalize_signed != 0U && raw > 180000U) {
         parsed_angle -= 360.0f;
     }
 
@@ -1442,23 +1447,20 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
 static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len)
 {
     /*
-     * Device manual section 6.3:
-     *   FF 01 00 0B 00 05 11
-     *   "打开或关闭角度回传--查询回传功能"
-     *
-     * The manual does not document the response layout, so expose the raw frame
-     * first. Once the real frame is known, parse it into angles.
+     * JSA-EFPTZDUSO4S extended manual:
+     *   FF 01 30 30 00 00 61: query current horizontal coordinate.
+     *   Response: FF 01 30 3B CD EF SS, where BCDEF = coordinate * 1000.
      */
-    return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_QUERY_RETURN,
-                                 0x00, 0x05, rx_buf, rx_len,
-                                 RX_TIMEOUT_MS, 0U);
+    return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, PELCOD_CMD_QUERY_PAN,
+                                 0x00, 0x00, rx_buf, rx_len,
+                                 QUERY_RX_TIMEOUT_MS, 0U);
 }
 
 static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len)
 {
     return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, cmnd2,
                                  0x00, 0x05, rx_buf, rx_len,
-                                 RX_TIMEOUT_MS, 0U);
+                                 QUERY_RX_TIMEOUT_MS, 0U);
 }
 
 static void USART2_RawDrainRx(void)
@@ -1520,6 +1522,7 @@ static void USART2_RawListenAndPrint(uint32_t listen_ms)
 int main(void)
 {
   HAL_Init(); // STM32 基础初始化
+  DWT_Delay_Init(); // 软件I2C/RS485方向控制依赖微秒延时，需尽早初始化
 
   // 仅仅初始化串口1 (PA9/PA10)
   USART1_RawInit_115200_HSI();
@@ -1535,7 +1538,6 @@ int main(void)
 
   // 4. 设置默认接收状态，防止总线冲突
   Set_RS485_Direction(0);
-  DWT_Delay_Init();
 
   // 5. 必须校准原点 (解锁绝对坐标定位功能)
   PelcoD_SetPreset(210);
