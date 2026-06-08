@@ -595,6 +595,7 @@ static void CommandLine_Service(void)
  *         TILT -20
  *         GOTO 45 30
  *         GET / GET RAW / GET PAN / GET TILT
+ *         ZERO
  *         HOME
  *         STOP
  */
@@ -649,6 +650,12 @@ static void CommandLine_Process(const char *line)
         delay_us(20000);
         PelcoD_SetAbsoluteTilt(0.0f);
         Debug_WriteString("OK HOME\r\n");
+        return;
+    }
+
+    if (strcmp(p, "ZERO") == 0) {
+        PelcoD_SetPreset(210);
+        Debug_WriteString("OK ZERO\r\n");
         return;
     }
 
@@ -787,7 +794,7 @@ static void CommandLine_Process(const char *line)
     }
 
     if (strcmp(p, "HELP") == 0) {
-        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, ZERO, STOP\r\n");
         return;
     }
 
@@ -1539,12 +1546,8 @@ int main(void)
   // 4. 设置默认接收状态，防止总线冲突
   Set_RS485_Direction(0);
 
-  // 5. 必须校准原点 (解锁绝对坐标定位功能)
-  PelcoD_SetPreset(210);
-  Delay_With_Heartbeat(3000); 
-
   Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
-  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, STOP\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, ZERO, STOP\r\n");
 
   while (1)
   {
