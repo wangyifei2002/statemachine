@@ -1410,7 +1410,7 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
 {
     uint8_t rx_buf[RX_BUFFER_SIZE] = {0};
     uint8_t rx_len = 0U;
-    uint16_t raw;
+    uint32_t raw;
     float parsed_angle;
 
     if (angle == NULL) {
@@ -1419,7 +1419,7 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
 
     if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, query_cmd,
                               0x00, 0x00, rx_buf, &rx_len,
-                              RX_TIMEOUT_MS, 0U) == 0U) {
+                              QUERY_RX_TIMEOUT_MS, 0U) == 0U) {
         return 0U;
     }
 
@@ -1460,14 +1460,14 @@ static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len)
      */
     return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, PELCOD_CMD_QUERY_PAN,
                                  0x00, 0x00, rx_buf, rx_len,
-                                 RX_TIMEOUT_MS, 0U);
+                                 QUERY_RX_TIMEOUT_MS, 0U);
 }
 
 static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len)
 {
     return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, cmnd2,
                                  0x00, 0x05, rx_buf, rx_len,
-                                 RX_TIMEOUT_MS, 0U);
+                                 QUERY_RX_TIMEOUT_MS, 0U);
 }
 
 static void USART2_RawDrainRx(void)
