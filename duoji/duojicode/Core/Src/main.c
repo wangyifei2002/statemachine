@@ -109,12 +109,12 @@ typedef struct {
 #define PELCOD_CMD_SET_PAN   0x4B  // 绝对水平定位操作码
 #define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
 #define PELCOD_EXT_CMND1      0x30  // JSA-EFPTZDUSO4S扩展指令
-#define PELCOD_CMD_QUERY_PAN  0x30  // 扩展指令：查询水平坐标位置
-#define PELCOD_CMD_QUERY_TILT 0x40  // 扩展指令：查询垂直坐标位置
+#define PELCOD_CMD_QUERY_PAN 0x30  // 手册：查询水平坐标位置 (FF 01 30 30 00 00 SS)
+#define PELCOD_CMD_QUERY_TILT 0x40 // 手册：查询垂直坐标位置 (FF 01 30 40 00 00 SS)
 #define PELCOD_CMD_RETURN_RT  0x09  // 手册：打开或关闭角度回传--实时回传功能
 #define PELCOD_CMD_QUERY_RETURN 0x0B // 手册：打开或关闭角度回传--查询回传功能
-#define PELCOD_RESP_PAN_POS_BASE  0x30  // 扩展指令：云台返回水平坐标位置，高半字节
-#define PELCOD_RESP_TILT_POS_BASE 0x40  // 扩展指令：云台返回垂直坐标位置，高半字节
+#define PELCOD_RESP_PAN_POS   0x3B  // 手册：云台回复水平当前位置
+#define PELCOD_RESP_TILT_POS  0x4B  // 手册：云台回复垂直当前位置
 
 #define RAW_LISTEN_MS          3000U
 /* USER CODE END PD */
@@ -1397,20 +1397,20 @@ void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
 
 static uint8_t PelcoD_QueryPan(float *angle)
 {
-    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS_BASE, angle, 0U);
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS, angle, 0U);
 }
 
 static uint8_t PelcoD_QueryTilt(float *angle)
 {
-    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS_BASE, angle, 1U);
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS, angle, 1U);
 }
 
-static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_base,
+static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
                                  float *angle, uint8_t normalize_signed)
 {
     uint8_t rx_buf[RX_BUFFER_SIZE] = {0};
     uint8_t rx_len = 0U;
-    uint32_t raw;
+    uint16_t raw;
     float parsed_angle;
 
     if (angle == NULL) {
@@ -1419,7 +1419,7 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_base,
 
     if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, query_cmd,
                               0x00, 0x00, rx_buf, &rx_len,
-                              QUERY_RX_TIMEOUT_MS, 0U) == 0U) {
+                              RX_TIMEOUT_MS, 0U) == 0U) {
         return 0U;
     }
 
@@ -1430,7 +1430,7 @@ static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_base,
     if (rx_buf[0] != PELCOD_SYNC_BYTE ||
         rx_buf[1] != PTZ_ADDR_DEFAULT ||
         rx_buf[2] != PELCOD_EXT_CMND1 ||
-        (rx_buf[3] & 0xF0U) != response_base) {
+        rx_buf[3] != response_cmd) {
         return 0U;
     }
 
@@ -1460,14 +1460,14 @@ static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len)
      */
     return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, PELCOD_CMD_QUERY_PAN,
                                  0x00, 0x00, rx_buf, rx_len,
-                                 QUERY_RX_TIMEOUT_MS, 0U);
+                                 RX_TIMEOUT_MS, 0U);
 }
 
 static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len)
 {
     return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, cmnd2,
                                  0x00, 0x05, rx_buf, rx_len,
-                                 QUERY_RX_TIMEOUT_MS, 0U);
+                                 RX_TIMEOUT_MS, 0U);
 }
 
 static void USART2_RawDrainRx(void)
