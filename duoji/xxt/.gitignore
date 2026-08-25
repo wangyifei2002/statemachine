@@ -1,0 +1,14 @@
+# Keil build output and machine-local settings for this project
+MDK-ARM/UART_SPEED_TEST/
+UART_SPEED_TEST/
+*.o
+*.d
+*.crf
+*.axf
+*.map
+*.lst
+*.lnp
+*.dep
+*.htm
+*.hex
+*.uvguix.*
