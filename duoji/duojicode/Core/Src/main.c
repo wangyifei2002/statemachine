@@ -1,0 +1,1689 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "i2c.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>      // 标准输入输出，用于 printf 重定向
+#include <string.h>     // 字符串处理，用于 memcpy 等
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef struct {
+    const char *name;
+    uint8_t cmnd2;
+    uint8_t data1;
+    uint8_t data2;
+} PelcoDPatternStep;
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+// ========== 硬件配置参数 ==========
+// PCF8574 I2C 地址 (7位地址为 0x20, 写操作时左移1位为 0x40)
+#define PCF8574_ADDR           0x40
+#define PCF8574_RS485_DIR_BIT  6U
+
+// Pelco-D 协议固定帧头
+#define PELCOD_SYNC_BYTE       0xFF
+
+// 云台默认地址 (可根据实际设备修改)
+#define PTZ_ADDR_DEFAULT       0x01
+
+// 控制命令码定义
+#define PELCOD_CMD_STOP        0x00    // 停止
+#define PELCOD_CMD_PAN_LEFT    0x04    // 水平向左
+#define PELCOD_CMD_PAN_RIGHT   0x02    // 水平向右
+#define PELCOD_CMD_TILT_UP     0x08    // 垂直向上
+#define PELCOD_CMD_TILT_DOWN   0x10    // 垂直向下
+
+// RS485 半双工切换延时 (us) - 发送完毕后需等待TX完全关闭再切换到RX
+#define RS485_TX_GAP_US        50
+
+// 接收超时时间 (ms)
+#define RX_TIMEOUT_MS           200
+#define QUERY_RX_TIMEOUT_MS     1000U
+#define RX_BUFFER_SIZE          16U
+#define RX_INTER_BYTE_TIMEOUT_MS 20U
+#define CMD_LINE_BUFFER_SIZE    64U
+#define PTZ_UART_DEFAULT_BAUDRATE 115200U
+#define PTZ_UART_CLOCK_HZ        64000000U
+
+// 云台巡检动作节拍：每 0.5 秒切换一次动作，便于肉眼确认方向
+#define PATTERN_STEP_INTERVAL_MS 500U
+#define PATTERN_RX_TIMEOUT_MS    50U
+#define PATTERN_PAN_SPEED        30U
+#define PATTERN_TILT_SPEED       20U
+
+// PB0 心跳灯闪烁间隔 (ms)，用于证明主循环未卡死
+#define HEARTBEAT_INTERVAL_MS   500U
+
+// 上电早期 LED 自检闪烁次数；如果要跳过自检，可改为 0
+#define BOOT_LED_SELF_TEST_BLINKS 6U
+
+// LED-only 板级点亮测试：1=只跑LED测试，不初始化I2C/USART/RS485
+#define LED_ONLY_BRINGUP_TEST 0U
+
+// USART1 板级串口测试：1=只跑LED+USART1测试，不初始化I2C/USART2/RS485
+#define USART1_BRINGUP_TEST    0U
+
+// USART1 原始串口发送测试：1=只用寄存器配置 PA9/USART1 TX，持续向电脑发送文本
+#define USART1_RAW_TX_TEST     0U
+#define USART1_RAW_BAUDRATE    115200U
+#define USART1_RAW_CLOCK_HZ    HSI_VALUE
+
+// RS485 + Pelco-D 云台闭环测试：1=raw USART1打印 + USART2/RS485控制云台，不使用LED
+#define RS485_PELCOD_TEST      0U
+
+// 软件 I2C 控制 PCF8574，避免当前阶段依赖 CubeMX I2C2 timing
+#define PCF8574_SCL_GPIO_Port  GPIOH
+#define PCF8574_SCL_Pin        GPIO_PIN_4
+#define PCF8574_SDA_GPIO_Port  GPIOH
+#define PCF8574_SDA_Pin        GPIO_PIN_5
+#define SOFT_I2C_DELAY_US      5U
+
+// ========== 新增绝对角度定位命令码 ==========
+#define PELCOD_CMD_SET_PAN   0x4B  // 绝对水平定位操作码
+#define PELCOD_CMD_SET_TILT  0x4D  // 绝对垂直定位操作码
+#define PELCOD_EXT_CMND1      0x30  // JSA-EFPTZDUSO4S扩展指令
+#define PELCOD_CMD_QUERY_PAN 0x30  // 手册：查询水平坐标位置 (FF 01 30 30 00 00 SS)
+#define PELCOD_CMD_QUERY_TILT 0x40 // 手册：查询垂直坐标位置 (FF 01 30 40 00 00 SS)
+#define PELCOD_CMD_RETURN_RT  0x09  // 手册：打开或关闭角度回传--实时回传功能
+#define PELCOD_CMD_QUERY_RETURN 0x0B // 手册：打开或关闭角度回传--查询回传功能
+#define PELCOD_RESP_PAN_POS   0x3B  // 手册：云台回复水平当前位置
+#define PELCOD_RESP_TILT_POS  0x4B  // 手册：云台回复垂直当前位置
+
+#define RAW_LISTEN_MS          3000U
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN PV */
+static uint8_t pcf8574_shadow = 0xFF;
+static uint8_t pcf8574_last_ack = 0;
+static uint32_t heartbeat_last_tick = 0;
+static uint32_t ptz_uart_baudrate = PTZ_UART_DEFAULT_BAUDRATE;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+// ========== 用户业务函数声明 ==========
+void Set_RS485_Direction(uint8_t to_transmit);
+void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                              uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                              uint8_t *rx_len, uint16_t timeout_ms);
+static uint8_t PelcoD_CalcChecksum(const uint8_t *packet, uint8_t len);
+static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len);
+static void LED_Toggle_Once(void);
+static void Heartbeat_Service(void);
+static void Delay_With_Heartbeat(uint32_t delay_ms);
+static void Board_LED_EarlySelfTest(void);
+static void Board_LED_BringupLoop(void);
+static void Board_USART1_BringupLoop(void);
+static void Board_USART1_RawTxLoop(void);
+static void Board_RS485_PelcoD_TestLoop(void);
+static void Run_PelcoD_PatternStep(const PelcoDPatternStep *step);
+static void USART1_RawInit_115200_HSI(void);
+static void USART1_RawWriteChar(char ch);
+static void USART1_RawWriteString(const char *s);
+static void USART1_RawWriteUInt(uint32_t value);
+static uint8_t USART1_RawReadCharNonBlocking(char *ch);
+static void Debug_WriteString(const char *s);
+static void Debug_WriteUInt(uint32_t value);
+static void Debug_WriteInt(int32_t value);
+static void Debug_WriteHexByte(uint8_t value);
+static void Debug_WriteAngle(float angle);
+static void CommandLine_Service(void);
+static void CommandLine_Process(const char *line);
+static uint8_t CommandLine_ParseFloat(const char **cursor, float *value);
+static uint8_t CommandLine_ParseUInt(const char **cursor, uint32_t *value);
+static void CommandLine_SkipSpaces(const char **cursor);
+static uint8_t CommandLine_IsEndOrSpace(char ch);
+static void PCF8574_SoftI2C_Init(void);
+static uint8_t PCF8574_WriteByte(uint8_t data);
+static void SoftI2C_SDA_Output(void);
+static void SoftI2C_SDA_Input(void);
+static void SoftI2C_SetSCL(uint8_t level);
+static void SoftI2C_SetSDA(uint8_t level);
+static void SoftI2C_Start(void);
+static void SoftI2C_Stop(void);
+static uint8_t SoftI2C_WriteByte(uint8_t data);
+static void Board_DelayMs(uint32_t delay_ms);
+static void DWT_Delay_Init(void);
+static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms);
+static uint8_t PelcoD_SendAndReceive(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                                     uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                                     uint8_t *rx_len, uint16_t timeout_ms,
+                                     uint8_t print_debug);
+static uint8_t PelcoD_QueryPan(float *angle);
+static uint8_t PelcoD_QueryTilt(float *angle);
+static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+                                 float *angle, uint8_t normalize_signed);
+static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len);
+static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len);
+static void USART2_RawDrainRx(void);
+static void USART2_RawListenAndPrint(uint32_t listen_ms);
+static void USART2_RawInit(uint32_t baudrate);
+void delay_us(uint32_t us);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+/**
+  * @brief 设置预置位 (Pelco-D 标准指令 0x03)
+  * @param preset_id: 预置位编号 (如手册中的 210)
+  */
+void PelcoD_SetPreset(uint8_t preset_id)
+{
+    uint8_t rx_buf[16];
+    uint8_t rx_len = 0;
+    // Command 2 = 0x03 (设置预置位)，Data2 = 预置位编号
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, 0x03, 
+                             0x00, preset_id, rx_buf, &rx_len, RX_TIMEOUT_MS);
+}
+
+/**
+  * @brief 控制云台移动到绝对水平角度 (对应手册水平范围 0° ~ 360°)
+  * @param angle: 目标绝对角度 (例如: 45.0 或 -45.0)
+  */
+void PelcoD_SetAbsolutePan(float angle)
+{
+    // 将 -45° 转换为 Pelco-D 坐标系下的 315°
+    if (angle < 0.0f) {
+        angle += 360.0f;
+    }
+    
+    // 协议规定：数据 = 实际角度 * 100
+    uint16_t angle_val = (uint16_t)(angle * 100.0f);
+    uint8_t data1 = (uint8_t)(angle_val >> 8);   // 角度高 8 位
+    uint8_t data2 = (uint8_t)(angle_val & 0xFF); // 角度低 8 位
+    
+    uint8_t rx_buf[16];
+    uint8_t rx_len = 0;
+
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_SET_PAN,
+                             data1, data2, rx_buf, &rx_len, RX_TIMEOUT_MS);
+}
+
+/**
+  * @brief 控制云台移动到绝对垂直角度 (对应手册垂直范围 -90° ~ 90°)
+  * @param angle: 目标绝对角度 (例如: 45.0 或 -45.0)
+  */
+void PelcoD_SetAbsoluteTilt(float angle)
+{
+    uint16_t angle_val;
+    if (angle >= 0.0f) {
+        angle_val = (uint16_t)(angle * 100.0f);
+    } else {
+        // 标准 Pelco-D 负角度（下俯）通常使用 360° 环绕表示 (360.0 + angle)
+        angle_val = (uint16_t)((360.0f + angle) * 100.0f);
+    }
+    
+    uint8_t data1 = (uint8_t)(angle_val >> 8);   // 角度高 8 位
+    uint8_t data2 = (uint8_t)(angle_val & 0xFF); // 角度低 8 位
+    
+    uint8_t rx_buf[16];
+    uint8_t rx_len = 0;
+
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_SET_TILT,
+                             data1, data2, rx_buf, &rx_len, RX_TIMEOUT_MS);
+}
+
+/**
+ * @brief  上电早期 LED 自检。
+ * @note   该函数在 SystemClock_Config、I2C、USART 初始化之前运行。
+ *         如果 DS1/PB0 在这里也不闪，优先排查固件启动、BOOT、LED硬件或板级跳线。
+ */
+static void Board_LED_EarlySelfTest(void)
+{
+#if (BOOT_LED_SELF_TEST_BLINKS > 0U)
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = DS1_GREEN_Pin | DS0_RED_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);
+
+    for (uint32_t i = 0; i < BOOT_LED_SELF_TEST_BLINKS; i++) {
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+        HAL_GPIO_TogglePin(DS0_RED_GPIO_Port, DS0_RED_Pin);
+        HAL_Delay(250);
+    }
+
+    HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);
+#endif
+}
+
+/**
+ * @brief  最小 LED 点亮/闪烁测试。
+ * @note   用于板级排查：不进入 SystemClock_Config，不初始化 I2C/USART/RS485。
+ *         如果这个循环里 DS1/PB0 仍不亮，问题基本在下载启动、LED管脚、跳线或硬件。
+ */
+static void Board_LED_BringupLoop(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = DS1_GREEN_Pin | DS0_RED_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    while (1) {
+        // 正点原子板载 DS0/DS1 按低电平点亮处理。
+        HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_RESET); // 绿灯亮
+        HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);       // 红灯灭
+        HAL_Delay(500);
+
+        HAL_GPIO_WritePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin, GPIO_PIN_SET);   // 绿灯灭
+        HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_RESET);     // 红灯亮
+        HAL_Delay(500);
+    }
+}
+
+/**
+ * @brief  LED + USART1 最小串口测试。
+ * @note   只初始化 DS0/DS1 GPIO 和 USART1。
+ *         刻意不调用 SystemClock_Config，避免外部 HSE/PLL 配置问题挡住 LED/串口排查。
+ *         不初始化 I2C2、USART2、RS485，方便单独验证 USB_UART/P11/CH340/串口助手链路。
+ */
+static void Board_USART1_BringupLoop(void)
+{
+    const char *banner =
+        "\r\n[UART TEST] USART1 bring-up started. Baud=115200, 8N1.\r\n"
+        "[UART TEST] DS1/PB0 heartbeat toggles every 500ms.\r\n";
+    uint32_t tick = 0;
+
+    MX_GPIO_Init();
+
+    for (uint32_t i = 0; i < 4U; i++) {
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+        HAL_Delay(125);
+    }
+
+    MX_USART1_UART_Init();
+
+    HAL_UART_Transmit(&huart1, (uint8_t *)banner, strlen(banner), 200);
+    printf("[printf] USART1 printf retarget OK.\r\n");
+
+    while (1) {
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+
+        if ((tick & 1U) == 0U) {
+            HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_SET);
+        } else {
+            HAL_GPIO_WritePin(DS0_RED_GPIO_Port, DS0_RED_Pin, GPIO_PIN_RESET);
+        }
+
+        printf("[UART TEST] tick=%lu, DS1/PB0 toggled, DS0/PB1=%s\r\n",
+               (unsigned long)tick,
+               ((tick & 1U) == 0U) ? "OFF" : "ON");
+
+        tick++;
+        HAL_Delay(500);
+    }
+}
+
+/**
+ * @brief  只用 USART1 TX 的最小串口输出测试。
+ * @note   不初始化 LED、I2C、USART2、RS485，也不调用 SystemClock_Config。
+ *         直接把 USART1 内核时钟切到 HSI，并把 PA9 配置为 USART1_TX。
+ */
+static void Board_USART1_RawTxLoop(void)
+{
+    uint32_t tick = 0;
+
+    USART1_RawInit_115200_HSI();
+
+    USART1_RawWriteString("\r\n[RAW USART1] PA9 TX only, 115200 8N1, clock=HSI.\r\n");
+    USART1_RawWriteString("[RAW USART1] If you see this, USB-UART/P11/PA9 path is alive.\r\n");
+
+    while (1) {
+        USART1_RawWriteString("[RAW USART1] tick=");
+        USART1_RawWriteUInt(tick++);
+        USART1_RawWriteString("\r\n");
+        HAL_Delay(500);
+    }
+}
+
+/**
+ * @brief  用寄存器直接初始化 USART1 TX/RX。
+ * @note   PA9=TX 输出调试信息，PA10=RX 接收电脑/Python 发来的文本命令。
+ *         目标是排除 HAL UART、系统 PLL、其它外设初始化带来的干扰。
+ */
+static void USART1_RawInit_115200_HSI(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* 确保 HSI 和 HSI kernel clock 可用。复位后通常已经开启，这里再显式打开一次。 */
+    SET_BIT(RCC->CR, RCC_CR_HSION | RCC_CR_HSIKERON);
+    while ((RCC->CR & RCC_CR_HSIRDY) == 0U) {
+        /* wait for HSI */
+    }
+
+#if defined(RCC_D2CCIP2R_USART16SEL) && defined(RCC_USART16CLKSOURCE_HSI)
+    MODIFY_REG(RCC->D2CCIP2R, RCC_D2CCIP2R_USART16SEL, RCC_USART16CLKSOURCE_HSI);
+#endif
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_USART1_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    CLEAR_BIT(USART1->CR1, USART_CR1_UE);
+
+    USART1->CR1 = 0U;
+    USART1->CR2 = 0U;
+    USART1->CR3 = 0U;
+    USART1->PRESC = 0U;
+    USART1->BRR = (USART1_RAW_CLOCK_HZ + (USART1_RAW_BAUDRATE / 2U)) / USART1_RAW_BAUDRATE;
+    USART1->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE;
+    SET_BIT(USART1->CR1, USART_CR1_UE);
+}
+
+/**
+ * @brief  USART1 轮询发送单个字符。
+ */
+static void USART1_RawWriteChar(char ch)
+{
+    while ((USART1->ISR & USART_ISR_TXE_TXFNF) == 0U) {
+        /* wait for TX FIFO not full */
+    }
+    USART1->TDR = (uint8_t)ch;
+}
+
+/**
+ * @brief  非阻塞读取 USART1 单个字符。
+ * @return 1=读到字符，0=当前没有新字符。
+ */
+static uint8_t USART1_RawReadCharNonBlocking(char *ch)
+{
+    uint32_t isr = USART1->ISR;
+
+    if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_PE | USART_ISR_NE)) != 0U) {
+        USART1->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    }
+
+    if ((USART1->ISR & USART_ISR_RXNE_RXFNE) == 0U) {
+        return 0U;
+    }
+
+    if (ch != NULL) {
+        *ch = (char)(USART1->RDR & 0xFFU);
+    } else {
+        (void)USART1->RDR;
+    }
+
+    return 1U;
+}
+
+/**
+ * @brief  USART1 轮询发送字符串。
+ */
+static void USART1_RawWriteString(const char *s)
+{
+    while (s != NULL && *s != '\0') {
+        USART1_RawWriteChar(*s++);
+    }
+
+    while ((USART1->ISR & USART_ISR_TC) == 0U) {
+        /* wait for complete transmission */
+    }
+}
+
+/**
+ * @brief  USART1 轮询发送十进制无符号整数。
+ */
+static void USART1_RawWriteUInt(uint32_t value)
+{
+    char buf[10];
+    uint32_t i = 0;
+
+    if (value == 0U) {
+        USART1_RawWriteChar('0');
+        return;
+    }
+
+    while (value > 0U && i < sizeof(buf)) {
+        buf[i++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    }
+
+    while (i > 0U) {
+        USART1_RawWriteChar(buf[--i]);
+    }
+}
+
+static void Debug_WriteString(const char *s)
+{
+    USART1_RawWriteString(s);
+}
+
+static void Debug_WriteUInt(uint32_t value)
+{
+    USART1_RawWriteUInt(value);
+}
+
+static void Debug_WriteInt(int32_t value)
+{
+    if (value < 0) {
+        USART1_RawWriteChar('-');
+        Debug_WriteUInt((uint32_t)(-value));
+    } else {
+        Debug_WriteUInt((uint32_t)value);
+    }
+}
+
+static void Debug_WriteHexByte(uint8_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+
+    USART1_RawWriteChar(hex[(value >> 4) & 0x0FU]);
+    USART1_RawWriteChar(hex[value & 0x0FU]);
+}
+
+static void Debug_WriteAngle(float angle)
+{
+    int32_t scaled = (int32_t)((angle * 100.0f) + ((angle >= 0.0f) ? 0.5f : -0.5f));
+    int32_t integer;
+    int32_t fraction;
+
+    integer = scaled / 100;
+    fraction = scaled % 100;
+    if (fraction < 0) {
+        fraction = -fraction;
+    }
+
+    Debug_WriteInt(integer);
+    USART1_RawWriteChar('.');
+    if (fraction < 10) {
+        USART1_RawWriteChar('0');
+    }
+    Debug_WriteUInt((uint32_t)fraction);
+}
+
+/**
+ * @brief  从 USART1 收集一行命令。Python 端每条命令以 \n 结尾。
+ */
+static void CommandLine_Service(void)
+{
+    static char line[CMD_LINE_BUFFER_SIZE];
+    static uint8_t len = 0U;
+    char ch;
+
+    while (USART1_RawReadCharNonBlocking(&ch) != 0U) {
+        if (ch == '\r') {
+            continue;
+        }
+
+        if (ch == '\n') {
+            line[len] = '\0';
+            if (len > 0U) {
+                CommandLine_Process(line);
+            }
+            len = 0U;
+            continue;
+        }
+
+        if (ch == '\b' || ch == 0x7F) {
+            if (len > 0U) {
+                len--;
+            }
+            continue;
+        }
+
+        if (ch < 32 || ch > 126) {
+            continue;
+        }
+
+        if (len < (CMD_LINE_BUFFER_SIZE - 1U)) {
+            line[len++] = ch;
+        } else {
+            len = 0U;
+            Debug_WriteString("ERR line too long\r\n");
+        }
+    }
+}
+
+/**
+ * @brief  解析 Python 发来的文本命令。
+ * @note   支持：
+ *         PAN 45
+ *         TILT -20
+ *         GOTO 45 30
+ *         GET / GET RAW / GET PAN / GET TILT
+ *         ZERO
+ *         HOME
+ *         STOP
+ */
+static void CommandLine_Process(const char *line)
+{
+    const char *p = line;
+    float pan;
+    float tilt;
+    uint8_t rx_buf[RX_BUFFER_SIZE];
+    uint8_t rx_len = 0U;
+
+    CommandLine_SkipSpaces(&p);
+
+    if (strncmp(p, "PAN", 3) == 0 && CommandLine_IsEndOrSpace(p[3]) != 0U) {
+        p += 3;
+        if (CommandLine_ParseFloat(&p, &pan) == 0U) {
+            Debug_WriteString("ERR usage: PAN <angle>\r\n");
+            return;
+        }
+        PelcoD_SetAbsolutePan(pan);
+        Debug_WriteString("OK PAN\r\n");
+        return;
+    }
+
+    if (strncmp(p, "TILT", 4) == 0 && CommandLine_IsEndOrSpace(p[4]) != 0U) {
+        p += 4;
+        if (CommandLine_ParseFloat(&p, &tilt) == 0U) {
+            Debug_WriteString("ERR usage: TILT <angle>\r\n");
+            return;
+        }
+        PelcoD_SetAbsoluteTilt(tilt);
+        Debug_WriteString("OK TILT\r\n");
+        return;
+    }
+
+    if (strncmp(p, "GOTO", 4) == 0 && CommandLine_IsEndOrSpace(p[4]) != 0U) {
+        p += 4;
+        if (CommandLine_ParseFloat(&p, &pan) == 0U ||
+            CommandLine_ParseFloat(&p, &tilt) == 0U) {
+            Debug_WriteString("ERR usage: GOTO <pan> <tilt>\r\n");
+            return;
+        }
+        PelcoD_SetAbsolutePan(pan);
+        delay_us(20000);
+        PelcoD_SetAbsoluteTilt(tilt);
+        Debug_WriteString("OK GOTO\r\n");
+        return;
+    }
+
+    if (strcmp(p, "HOME") == 0) {
+        PelcoD_SetAbsolutePan(0.0f);
+        delay_us(20000);
+        PelcoD_SetAbsoluteTilt(0.0f);
+        Debug_WriteString("OK HOME\r\n");
+        return;
+    }
+
+    if (strcmp(p, "ZERO") == 0) {
+        PelcoD_SetPreset(210);
+        Debug_WriteString("OK ZERO\r\n");
+        return;
+    }
+
+    if (strcmp(p, "STOP") == 0) {
+        PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, PELCOD_CMD_STOP,
+                                 0x00, 0x00, rx_buf, &rx_len, RX_TIMEOUT_MS);
+        Debug_WriteString("OK STOP\r\n");
+        return;
+    }
+
+    if (strncmp(p, "RETURN", 6) == 0 && CommandLine_IsEndOrSpace(p[6]) != 0U) {
+        p += 6;
+        CommandLine_SkipSpaces(&p);
+
+        if (strcmp(p, "RT") == 0) {
+            (void)PelcoD_SetReturnMode(PELCOD_CMD_RETURN_RT, rx_buf, &rx_len);
+            Debug_WriteString("OK RETURN RT");
+        } else if (strcmp(p, "QUERY") == 0) {
+            (void)PelcoD_SetReturnMode(PELCOD_CMD_QUERY_RETURN, rx_buf, &rx_len);
+            Debug_WriteString("OK RETURN QUERY");
+        } else {
+            Debug_WriteString("ERR usage: RETURN [RT|QUERY]\r\n");
+            return;
+        }
+
+        if (rx_len > 0U) {
+            Debug_WriteString(" RX=");
+            for (uint8_t i = 0U; i < rx_len; i++) {
+                Debug_WriteHexByte(rx_buf[i]);
+                if ((uint8_t)(i + 1U) < rx_len) {
+                    USART1_RawWriteChar(' ');
+                }
+            }
+        } else {
+            Debug_WriteString(" RX=<NO DATA>");
+        }
+        Debug_WriteString("\r\n");
+        return;
+    }
+
+    if (strcmp(p, "LISTEN RAW") == 0) {
+        USART2_RawListenAndPrint(RAW_LISTEN_MS);
+        return;
+    }
+
+    if (strncmp(p, "BAUD", 4) == 0 && CommandLine_IsEndOrSpace(p[4]) != 0U) {
+        uint32_t baudrate;
+
+        p += 4;
+        CommandLine_SkipSpaces(&p);
+        if (*p == '\0') {
+            Debug_WriteString("BAUD ");
+            Debug_WriteUInt(ptz_uart_baudrate);
+            Debug_WriteString("\r\n");
+            return;
+        }
+
+        if (CommandLine_ParseUInt(&p, &baudrate) == 0U ||
+            (baudrate != 9600U && baudrate != 115200U)) {
+            Debug_WriteString("ERR usage: BAUD [9600|115200]\r\n");
+            return;
+        }
+
+        Set_RS485_Direction(0);
+        USART2_RawInit(baudrate);
+        Set_RS485_Direction(0);
+
+        Debug_WriteString("OK BAUD ");
+        Debug_WriteUInt(baudrate);
+        Debug_WriteString("\r\n");
+        return;
+    }
+
+    if (strncmp(p, "GET", 3) == 0 && CommandLine_IsEndOrSpace(p[3]) != 0U) {
+        p += 3;
+        CommandLine_SkipSpaces(&p);
+
+        if (strcmp(p, "RAW") == 0) {
+            if (PelcoD_QueryReturnRaw(rx_buf, &rx_len) == 0U) {
+                Debug_WriteString("ERR query raw\r\n");
+                return;
+            }
+
+            Debug_WriteString("RAW");
+            if (rx_len == 0U) {
+                Debug_WriteString(" <NO DATA>");
+            } else {
+                Debug_WriteString(" ");
+                for (uint8_t i = 0U; i < rx_len; i++) {
+                    Debug_WriteHexByte(rx_buf[i]);
+                    if ((uint8_t)(i + 1U) < rx_len) {
+                        USART1_RawWriteChar(' ');
+                    }
+                }
+            }
+            Debug_WriteString("\r\n");
+            return;
+        }
+
+        if (*p == '\0' || strcmp(p, "PAN") == 0) {
+            if (PelcoD_QueryPan(&pan) == 0U) {
+                Debug_WriteString("ERR query pan\r\n");
+                return;
+            }
+
+            Debug_WriteString("ANGLE PAN=");
+            Debug_WriteAngle(pan);
+
+            if (*p != '\0') {
+                Debug_WriteString("\r\n");
+                return;
+            }
+        }
+
+        if (*p == '\0' || strcmp(p, "TILT") == 0) {
+            if (PelcoD_QueryTilt(&tilt) == 0U) {
+                if (*p == '\0') {
+                    Debug_WriteString("\r\n");
+                }
+                Debug_WriteString("ERR query tilt\r\n");
+                return;
+            }
+
+            if (*p != '\0') {
+                Debug_WriteString("ANGLE TILT=");
+            } else {
+                Debug_WriteString(" TILT=");
+            }
+            Debug_WriteAngle(tilt);
+            Debug_WriteString("\r\n");
+            return;
+        }
+
+        Debug_WriteString("ERR usage: GET [RAW|PAN|TILT]\r\n");
+        return;
+    }
+
+    if (strcmp(p, "HELP") == 0) {
+        Debug_WriteString("CMD: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, ZERO, STOP\r\n");
+        return;
+    }
+
+    Debug_WriteString("ERR unknown command\r\n");
+}
+
+static void CommandLine_SkipSpaces(const char **cursor)
+{
+    while (cursor != NULL && *cursor != NULL && (**cursor == ' ' || **cursor == '\t')) {
+        (*cursor)++;
+    }
+}
+
+static uint8_t CommandLine_IsEndOrSpace(char ch)
+{
+    return (uint8_t)(ch == '\0' || ch == ' ' || ch == '\t');
+}
+
+/**
+ * @brief  轻量解析浮点数，避免依赖 scanf 的浮点解析开关。
+ */
+static uint8_t CommandLine_ParseFloat(const char **cursor, float *value)
+{
+    const char *p;
+    int sign = 1;
+    uint32_t integer = 0U;
+    uint32_t fraction = 0U;
+    uint32_t scale = 1U;
+    uint8_t has_digit = 0U;
+
+    if (cursor == NULL || *cursor == NULL || value == NULL) {
+        return 0U;
+    }
+
+    p = *cursor;
+    CommandLine_SkipSpaces(&p);
+
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    } else if (*p == '+') {
+        p++;
+    }
+
+    while (*p >= '0' && *p <= '9') {
+        has_digit = 1U;
+        integer = (integer * 10U) + (uint32_t)(*p - '0');
+        p++;
+    }
+
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            has_digit = 1U;
+            if (scale < 1000000U) {
+                fraction = (fraction * 10U) + (uint32_t)(*p - '0');
+                scale *= 10U;
+            }
+            p++;
+        }
+    }
+
+    if (has_digit == 0U) {
+        return 0U;
+    }
+
+    *value = ((float)integer + ((float)fraction / (float)scale)) * (float)sign;
+    *cursor = p;
+    return 1U;
+}
+
+static uint8_t CommandLine_ParseUInt(const char **cursor, uint32_t *value)
+{
+    const char *p;
+    uint32_t parsed = 0U;
+    uint8_t has_digit = 0U;
+
+    if (cursor == NULL || *cursor == NULL || value == NULL) {
+        return 0U;
+    }
+
+    p = *cursor;
+    CommandLine_SkipSpaces(&p);
+
+    while (*p >= '0' && *p <= '9') {
+        has_digit = 1U;
+        parsed = (parsed * 10U) + (uint32_t)(*p - '0');
+        p++;
+    }
+
+    if (has_digit == 0U) {
+        return 0U;
+    }
+
+    CommandLine_SkipSpaces(&p);
+    if (*p != '\0') {
+        return 0U;
+    }
+
+    *value = parsed;
+    *cursor = p;
+    return 1U;
+}
+
+/**
+ * @brief  RS485 + Pelco-D 云台闭环测试入口。
+ * @note   该测试不使用 LED，不调用 SystemClock_Config，不初始化 I2C2 HAL。
+ *         USART1 采用 raw TX 承载 printf，USART2 使用 HAL_UART_Transmit/Receive 控制云台。
+ */
+static void Board_RS485_PelcoD_TestLoop(void)
+{
+    static const PelcoDPatternStep pattern[] = {
+        {"left",       PELCOD_CMD_PAN_LEFT,                          PATTERN_PAN_SPEED,  0U},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"right",      PELCOD_CMD_PAN_RIGHT,                         PATTERN_PAN_SPEED,  0U},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"up",         PELCOD_CMD_TILT_UP,                           0U,                 PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"down",       PELCOD_CMD_TILT_DOWN,                         0U,                 PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"left-up",    PELCOD_CMD_PAN_LEFT | PELCOD_CMD_TILT_UP,     PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"right-up",   PELCOD_CMD_PAN_RIGHT | PELCOD_CMD_TILT_UP,    PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"left-down",  PELCOD_CMD_PAN_LEFT | PELCOD_CMD_TILT_DOWN,   PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+        {"right-down", PELCOD_CMD_PAN_RIGHT | PELCOD_CMD_TILT_DOWN,  PATTERN_PAN_SPEED,  PATTERN_TILT_SPEED},
+        {"stop",       PELCOD_CMD_STOP,                              0U,                 0U},
+    };
+
+    USART1_RawInit_115200_HSI();
+    Debug_WriteString("\r\n[BOOT] raw USART1 is alive before RS485 init.\r\n");
+    DWT_Delay_Init();
+
+    Debug_WriteString("========================================\r\n");
+    Debug_WriteString("[SYSTEM] RS485 Pelco-D test start\r\n");
+    Debug_WriteString("[SYSTEM] USART1: PA9 raw debug, 115200 8N1\r\n");
+    Debug_WriteString("[SYSTEM] USART2: PA2/PA3 RS485, Pelco-D 115200 8N1\r\n");
+    Debug_WriteString("========================================\r\n");
+
+    PCF8574_SoftI2C_Init();
+    Set_RS485_Direction(0);
+    Debug_WriteString("[SYSTEM] PCF8574 dir init: ");
+    Debug_WriteString(pcf8574_last_ack ? "ACK OK" : "ACK FAIL");
+    Debug_WriteString(", default RX mode\r\n");
+
+    Debug_WriteString("[SYSTEM] init USART2...\r\n");
+    MX_USART2_UART_Init();
+    Debug_WriteString("[SYSTEM] USART2 init done, start sequence\r\n\r\n");
+
+    while (1) {
+        for (uint32_t i = 0; i < (sizeof(pattern) / sizeof(pattern[0])); i++) {
+            Run_PelcoD_PatternStep(&pattern[i]);
+        }
+
+        Debug_WriteString("\r\n[SYSTEM] one direction-check sequence done\r\n\r\n");
+    }
+}
+
+/**
+ * @brief  执行一个 0.5 秒巡检动作。
+ * @note   总节拍包含发送、短接收窗口和剩余等待时间，尽量保持 500ms 切换一次。
+ */
+static void Run_PelcoD_PatternStep(const PelcoDPatternStep *step)
+{
+    uint8_t rx_buf[RX_BUFFER_SIZE];
+    uint8_t rx_len = 0;
+    uint32_t start_tick;
+    uint32_t elapsed_ms;
+
+    if (step == NULL) {
+        return;
+    }
+
+    Debug_WriteString("[STEP] ");
+    Debug_WriteString(step->name);
+    Debug_WriteString(", interval_ms=");
+    Debug_WriteUInt(PATTERN_STEP_INTERVAL_MS);
+    Debug_WriteString("\r\n");
+
+    start_tick = HAL_GetTick();
+    PelcoD_Control_And_Query(PTZ_ADDR_DEFAULT, 0x00, step->cmnd2,
+                             step->data1, step->data2, rx_buf, &rx_len,
+                             PATTERN_RX_TIMEOUT_MS);
+
+    elapsed_ms = (uint32_t)(HAL_GetTick() - start_tick);
+    if (elapsed_ms < PATTERN_STEP_INTERVAL_MS) {
+        Board_DelayMs(PATTERN_STEP_INTERVAL_MS - elapsed_ms);
+    }
+}
+
+/**
+ * @brief  初始化软件 I2C GPIO，用于控制 PCF8574。
+ */
+static void PCF8574_SoftI2C_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = PCF8574_SCL_Pin | PCF8574_SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+
+    SoftI2C_SetSCL(1);
+    SoftI2C_SetSDA(1);
+    delay_us(20);
+}
+
+/**
+ * @brief  向 PCF8574 写 1 字节。
+ * @return 1=地址和数据均收到 ACK，0=至少一次无 ACK。
+ */
+static uint8_t PCF8574_WriteByte(uint8_t data)
+{
+    uint8_t addr_ack;
+    uint8_t data_ack;
+
+    SoftI2C_Start();
+    addr_ack = SoftI2C_WriteByte(PCF8574_ADDR);
+    data_ack = SoftI2C_WriteByte(data);
+    SoftI2C_Stop();
+
+    return (uint8_t)(addr_ack && data_ack);
+}
+
+static void SoftI2C_SDA_Output(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = PCF8574_SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PCF8574_SDA_GPIO_Port, &GPIO_InitStruct);
+}
+
+static void SoftI2C_SDA_Input(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = PCF8574_SDA_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PCF8574_SDA_GPIO_Port, &GPIO_InitStruct);
+}
+
+static void SoftI2C_SetSCL(uint8_t level)
+{
+    HAL_GPIO_WritePin(PCF8574_SCL_GPIO_Port, PCF8574_SCL_Pin,
+                      level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void SoftI2C_SetSDA(uint8_t level)
+{
+    HAL_GPIO_WritePin(PCF8574_SDA_GPIO_Port, PCF8574_SDA_Pin,
+                      level ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void SoftI2C_Start(void)
+{
+    SoftI2C_SDA_Output();
+    SoftI2C_SetSDA(1);
+    SoftI2C_SetSCL(1);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSDA(0);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSCL(0);
+    delay_us(SOFT_I2C_DELAY_US);
+}
+
+static void SoftI2C_Stop(void)
+{
+    SoftI2C_SDA_Output();
+    SoftI2C_SetSDA(0);
+    SoftI2C_SetSCL(1);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSDA(1);
+    delay_us(SOFT_I2C_DELAY_US);
+}
+
+/**
+ * @brief  软件 I2C 写 1 字节并读取 ACK。
+ * @return 1=ACK，0=NACK。
+ */
+static uint8_t SoftI2C_WriteByte(uint8_t data)
+{
+    uint8_t ack;
+
+    SoftI2C_SDA_Output();
+    for (uint8_t mask = 0x80U; mask != 0U; mask >>= 1U) {
+        SoftI2C_SetSDA((data & mask) ? 1U : 0U);
+        delay_us(SOFT_I2C_DELAY_US);
+        SoftI2C_SetSCL(1);
+        delay_us(SOFT_I2C_DELAY_US);
+        SoftI2C_SetSCL(0);
+        delay_us(SOFT_I2C_DELAY_US);
+    }
+
+    SoftI2C_SetSDA(1);
+    SoftI2C_SDA_Input();
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SetSCL(1);
+    delay_us(SOFT_I2C_DELAY_US);
+    ack = (HAL_GPIO_ReadPin(PCF8574_SDA_GPIO_Port, PCF8574_SDA_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+    SoftI2C_SetSCL(0);
+    delay_us(SOFT_I2C_DELAY_US);
+    SoftI2C_SDA_Output();
+
+    return ack;
+}
+
+/**
+ * @brief  板级延时封装，当前测试阶段不驱动 LED。
+ */
+static void Board_DelayMs(uint32_t delay_ms)
+{
+    HAL_Delay(delay_ms);
+}
+
+/**
+ * @brief  通过 PCF8574 的 P6 引脚控制 RS485 收发方向
+ * @param  to_transmit: 1=发送模式(高电平使能发送驱动器), 0=接收模式(低电平使能接收器)
+ * @note   使用 pcf8574_shadow 保留其它扩展口位，避免切换485方向时误改其它引脚。
+ */
+void Set_RS485_Direction(uint8_t to_transmit)
+{
+    if (to_transmit) {
+        // 发送模式：P6 置高
+        pcf8574_shadow |= (uint8_t)(1U << PCF8574_RS485_DIR_BIT);
+    } else {
+        // 接收模式：P6 置低
+        pcf8574_shadow &= (uint8_t)~(1U << PCF8574_RS485_DIR_BIT);
+    }
+
+    // 当前 bring-up 阶段使用 PH4/PH5 软件 I2C，避免依赖 CubeMX I2C timing。
+    // 注意：方向切换函数内不打印，避免发送结束后切回接收被 printf 拖慢。
+    pcf8574_last_ack = PCF8574_WriteByte(pcf8574_shadow);
+}
+
+/**
+ * @brief  计算 Pelco-D 协议校验和 (简单累加和，截断低8位)
+ * @param  packet: 原始数据帧 (从地址字节开始，不包含 0xFF 同步头)
+ * @param  len:   数据长度 (不含同步头，通常为6)
+ * @return 校验和字节
+ */
+static uint8_t PelcoD_CalcChecksum(const uint8_t *packet, uint8_t len)
+{
+    uint8_t sum = 0;
+    for (uint8_t i = 0; i < len; i++) {
+        sum += packet[i];
+    }
+    return sum & 0xFF;
+}
+
+/**
+ * @brief  打印十六进制数据帧 (格式化输出，方便调试观察)
+ * @param  prefix: 前缀字符串，如 "[TX]" 或 "[RX]"
+ * @param  data:   数据指针
+ * @param  len:    数据长度
+ */
+static void PrintHexFrame(const char *prefix, const uint8_t *data, uint8_t len)
+{
+    Debug_WriteString(prefix);
+    Debug_WriteString(" ");
+    for (uint8_t i = 0; i < len; i++) {
+        Debug_WriteHexByte(data[i]);
+        Debug_WriteString(" ");
+    }
+    Debug_WriteString("\r\n");
+}
+
+/**
+ * @brief  翻转 PB1 红灯，用于指示测试动作发生切换。
+ * @note   PB0 独立作为 500ms 心跳灯，不再由动作切换函数控制。
+ */
+static void LED_Toggle_Once(void)
+{
+    HAL_GPIO_TogglePin(DS0_RED_GPIO_Port, DS0_RED_Pin);
+}
+
+/**
+ * @brief  PB0 绿灯 500ms 心跳服务。
+ * @note   需要在主循环和长延时中周期性调用；使用 HAL_GetTick，可自然处理计数回绕。
+ */
+static void Heartbeat_Service(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((uint32_t)(now - heartbeat_last_tick) >= HEARTBEAT_INTERVAL_MS) {
+        heartbeat_last_tick = now;
+        HAL_GPIO_TogglePin(DS1_GREEN_GPIO_Port, DS1_GREEN_Pin);
+    }
+}
+
+/**
+ * @brief  带心跳服务的阻塞延时。
+ * @param  delay_ms: 延时时间，单位 ms。
+ * @note   替代直接 HAL_Delay(3000/2000)，避免长延时期间 PB0 心跳停止。
+ */
+static void Delay_With_Heartbeat(uint32_t delay_ms)
+{
+    uint32_t start = HAL_GetTick();
+
+    while ((uint32_t)(HAL_GetTick() - start) < delay_ms) {
+        Heartbeat_Service();
+        HAL_Delay(10);
+    }
+}
+
+/**
+ * @brief  使用 USART2 raw 轮询读取一帧可能长度不固定的云台回传。
+ * @note   USART2 当前由寄存器直接初始化，不能依赖 huart2 的 HAL 状态。
+ */
+static uint8_t PelcoD_ReceiveResponse(uint8_t *rx_buf, uint8_t max_len, uint16_t first_byte_timeout_ms)
+{
+    uint8_t len = 0;
+
+    if (rx_buf == NULL || max_len == 0U) {
+        return 0;
+    }
+
+    while (len < max_len) {
+        uint16_t timeout = (len == 0U) ? first_byte_timeout_ms : RX_INTER_BYTE_TIMEOUT_MS;
+        uint32_t start = HAL_GetTick();
+        uint8_t received = 0U;
+
+        while ((uint32_t)(HAL_GetTick() - start) < timeout) {
+            uint32_t isr = USART2->ISR;
+
+            if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_PE | USART_ISR_NE)) != 0U) {
+                USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+            }
+
+            if ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+                rx_buf[len++] = (uint8_t)(USART2->RDR & 0xFFU);
+                received = 1U;
+                break;
+            }
+        }
+
+        if (received == 0U) {
+            break;
+        }
+    }
+
+    return len;
+}
+
+/**
+ * @brief  完整的 Pelco-D 半双工闭环控制+查询函数
+ *
+ * 该函数执行以下步骤：
+ *   1. 组装7字节标准 Pelco-D 指令帧 (同步头+地址+命令1+命令2+数据1+数据2+校验和)
+ *   2. 切换 RS485 为发送模式
+ *   3. 通过 USART2 阻塞发送7字节
+ *   4. 延时极短时间确保最后一个bit离开发送器
+ *   5. 立即切换 RS485 为接收模式
+ *   6. raw 轮询 USART2 等待云台回传
+ *   7. 根据结果打印发送提示、回传数据或超时提示
+ *
+ * @param  addr:      云台设备地址 (默认0x01)
+ * @param  cmnd1:    命令字节1 (通常为0x00或与镜物选择有关)
+ * @param  cmnd2:    命令字节2 (控制方向：0x04=左转，0x08=上转，0x00=停止 等)
+ * @param  data1:    数据字节1 (水平速度，0x01~0x3F，0x00=停止)
+ * @param  data2:    数据字节2 (垂直速度，0x01~0x3F，0x00=停止)
+ * @param  rx_buf:   接收缓存指针，用于输出回传数据
+ * @param  rx_len:   接收到的数据长度指针，用于输出实际接收字节数
+ * @param  timeout_ms: 接收超时时间 (毫秒)
+ */
+static uint8_t PelcoD_SendAndReceive(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                                     uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                                     uint8_t *rx_len, uint16_t timeout_ms,
+                                     uint8_t print_debug)
+{
+    uint8_t tx_packet[7];
+    uint8_t rx_temp[RX_BUFFER_SIZE] = {0};
+    uint8_t actual_len = 0;
+
+    if (rx_len != NULL) {
+        *rx_len = 0;
+    }
+
+    // ========== Step 1: 组装 Pelco-D 指令帧 ==========
+    tx_packet[0] = PELCOD_SYNC_BYTE;     // 同步头固定 0xFF
+    tx_packet[1] = addr;                  // 设备地址
+    tx_packet[2] = cmnd1;                 // 命令1
+    tx_packet[3] = cmnd2;                 // 命令2
+    tx_packet[4] = data1;                 // 数据1 (水平速度)
+    tx_packet[5] = data2;                 // 数据2 (垂直速度)
+    // 校验和 = 地址 + 命令1 + 命令2 + 数据1 + 数据2 的低8位累加和
+    tx_packet[6] = PelcoD_CalcChecksum(&tx_packet[1], 5);
+
+    // ========== Step 2: 切换 RS485 为发送模式 ==========
+    Set_RS485_Direction(1);  // P6=1，发送驱动器使能
+
+    // ========== Step 3: 强制底层寄存器轮询发送 (不再受 HAL 库鸟气) ==========
+    // 强制清理之前的状态，防止卡死
+    USART2_RawDrainRx();
+    
+    // 极短延时，确保 RS485 芯片的发送使能引脚已完全拉高
+    delay_us(50); 
+
+    for (int i = 0; i < 7; i++) {
+        // 等待发送数据寄存器为空 (TXE)
+        while ((USART2->ISR & USART_ISR_TXE_TXFNF) == 0) {} 
+        // 将数据塞进硬件发射膛
+        USART2->TDR = tx_packet[i]; 
+    }
+    // 等待所有数据顺着线缆完全发送完毕 (TC)
+    while ((USART2->ISR & USART_ISR_TC) == 0) {} 
+
+    HAL_StatusTypeDef tx_ret = HAL_OK; // 手动给个 OK，骗过下面的检查逻辑
+
+    // ========== Step 4: 极短延时确保最后一bit已从TX线移出 ==========
+    // USART2 为 115200bps，HAL_UART_Transmit 返回前通常已等待 TC；
+    // 这里保留一个很短的保护间隔，再立即切回接收。
+    // 延时后必须立即切回接收，切方向绝不能被任何打印拖慢！
+    delay_us(RS485_TX_GAP_US);
+
+    // ========== Step 5: 立即切换 RS485 为接收模式 ==========
+    Set_RS485_Direction(0);  // P6=0，接收器使能，发送驱动器禁用
+
+    // ========== Step 6: 等待接收云台回传 (在切换到RX后立即开始) ==========
+    memset(rx_temp, 0, sizeof(rx_temp));
+    if (tx_ret == HAL_OK) {
+        actual_len = PelcoD_ReceiveResponse(rx_temp, RX_BUFFER_SIZE, timeout_ms);
+    }
+
+    // ========== Step 7: 接收完成后才打印提示 (避免拖慢485方向切换和接收起始时刻) ==========
+    if (tx_ret != HAL_OK) {
+        if (print_debug != 0U) {
+            Debug_WriteString("[PC] USART2 transmit failed, HAL status=");
+            Debug_WriteUInt((uint32_t)tx_ret);
+            Debug_WriteString("\r\n");
+            PrintHexFrame("[TX]", tx_packet, 7);
+        }
+        return 0U;
+    }
+
+    if (print_debug != 0U) {
+        Debug_WriteString("[PC] sent command: ");
+        if (cmnd2 == PELCOD_CMD_STOP) {
+            Debug_WriteString("stop\r\n");
+        } else {
+            Debug_WriteString("move");
+            if ((cmnd2 & PELCOD_CMD_PAN_LEFT) != 0U) {
+                Debug_WriteString(" left");
+            }
+            if ((cmnd2 & PELCOD_CMD_PAN_RIGHT) != 0U) {
+                Debug_WriteString(" right");
+            }
+            if ((cmnd2 & PELCOD_CMD_TILT_UP) != 0U) {
+                Debug_WriteString(" up");
+            }
+            if ((cmnd2 & PELCOD_CMD_TILT_DOWN) != 0U) {
+                Debug_WriteString(" down");
+            }
+            Debug_WriteString(", pan_speed=");
+            Debug_WriteUInt(data1);
+            Debug_WriteString(", tilt_speed=");
+            Debug_WriteUInt(data2);
+            Debug_WriteString("\r\n");
+        }
+        PrintHexFrame("[TX]", tx_packet, 7);
+    }
+
+    if (actual_len > 0U) {
+        if (rx_buf != NULL && rx_len != NULL) {
+            memcpy(rx_buf, rx_temp, actual_len);
+            *rx_len = actual_len;
+        }
+        if (print_debug != 0U) {
+            Debug_WriteString("[PC] received response, len=");
+            Debug_WriteUInt(actual_len);
+            Debug_WriteString("\r\n");
+            PrintHexFrame("[RX]", rx_temp, actual_len);
+        }
+        return 1U;
+    } else {
+        if (print_debug != 0U) {
+            Debug_WriteString("[PC] response timeout, wait_ms=");
+            Debug_WriteUInt(timeout_ms);
+            Debug_WriteString("\r\n");
+        }
+        return 0U;
+    }
+}
+
+void PelcoD_Control_And_Query(uint8_t addr, uint8_t cmnd1, uint8_t cmnd2,
+                              uint8_t data1, uint8_t data2, uint8_t *rx_buf,
+                              uint8_t *rx_len, uint16_t timeout_ms)
+{
+    (void)PelcoD_SendAndReceive(addr, cmnd1, cmnd2, data1, data2,
+                                rx_buf, rx_len, timeout_ms, 1U);
+}
+
+static uint8_t PelcoD_QueryPan(float *angle)
+{
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_PAN, PELCOD_RESP_PAN_POS, angle, 0U);
+}
+
+static uint8_t PelcoD_QueryTilt(float *angle)
+{
+    return PelcoD_QueryAngle(PELCOD_CMD_QUERY_TILT, PELCOD_RESP_TILT_POS, angle, 1U);
+}
+
+static uint8_t PelcoD_QueryAngle(uint8_t query_cmd, uint8_t response_cmd,
+                                 float *angle, uint8_t normalize_signed)
+{
+    uint8_t rx_buf[RX_BUFFER_SIZE] = {0};
+    uint8_t rx_len = 0U;
+    uint32_t raw;
+    float parsed_angle;
+
+    if (angle == NULL) {
+        return 0U;
+    }
+
+    if (PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, query_cmd,
+                              0x00, 0x00, rx_buf, &rx_len,
+                              QUERY_RX_TIMEOUT_MS, 0U) == 0U) {
+        return 0U;
+    }
+
+    if (rx_len < 7U) {
+        return 0U;
+    }
+
+    if (rx_buf[0] != PELCOD_SYNC_BYTE ||
+        rx_buf[1] != PTZ_ADDR_DEFAULT ||
+        rx_buf[2] != PELCOD_EXT_CMND1 ||
+        rx_buf[3] != response_cmd) {
+        return 0U;
+    }
+
+    if (PelcoD_CalcChecksum(&rx_buf[1], 5) != rx_buf[6]) {
+        return 0U;
+    }
+
+    raw = (((uint32_t)rx_buf[3] & 0x0FU) << 16) |
+          ((uint32_t)rx_buf[4] << 8) |
+          (uint32_t)rx_buf[5];
+    parsed_angle = (float)raw / 1000.0f;
+
+    if (normalize_signed != 0U && raw > 180000U) {
+        parsed_angle -= 360.0f;
+    }
+
+    *angle = parsed_angle;
+    return 1U;
+}
+
+static uint8_t PelcoD_QueryReturnRaw(uint8_t *rx_buf, uint8_t *rx_len)
+{
+    /*
+     * JSA-EFPTZDUSO4S extended manual:
+     *   FF 01 30 30 00 00 61: query current horizontal coordinate.
+     *   Response: FF 01 30 3B CD EF SS, where BCDEF = coordinate * 1000.
+     */
+    return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, PELCOD_EXT_CMND1, PELCOD_CMD_QUERY_PAN,
+                                 0x00, 0x00, rx_buf, rx_len,
+                                 QUERY_RX_TIMEOUT_MS, 0U);
+}
+
+static uint8_t PelcoD_SetReturnMode(uint8_t cmnd2, uint8_t *rx_buf, uint8_t *rx_len)
+{
+    return PelcoD_SendAndReceive(PTZ_ADDR_DEFAULT, 0x00, cmnd2,
+                                 0x00, 0x05, rx_buf, rx_len,
+                                 QUERY_RX_TIMEOUT_MS, 0U);
+}
+
+static void USART2_RawDrainRx(void)
+{
+    USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+    while ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+        (void)USART2->RDR;
+    }
+}
+
+static void USART2_RawListenAndPrint(uint32_t listen_ms)
+{
+    uint32_t start;
+    uint8_t count = 0U;
+
+    Set_RS485_Direction(0);
+    USART2_RawDrainRx();
+
+    Debug_WriteString("LISTEN RAW START ms=");
+    Debug_WriteUInt(listen_ms);
+    Debug_WriteString("\r\n");
+
+    start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start) < listen_ms) {
+        uint32_t isr = USART2->ISR;
+
+        if ((isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_PE | USART_ISR_NE)) != 0U) {
+            USART2->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_PECF | USART_ICR_NECF;
+            Debug_WriteString("LISTEN ERR ISR=0x");
+            Debug_WriteHexByte((uint8_t)(isr & 0xFFU));
+            Debug_WriteString("\r\n");
+        }
+
+        if ((USART2->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+            uint8_t byte = (uint8_t)(USART2->RDR & 0xFFU);
+            if (count == 0U) {
+                Debug_WriteString("RAW ");
+            }
+            Debug_WriteHexByte(byte);
+            USART1_RawWriteChar(' ');
+            count++;
+        }
+    }
+
+    if (count == 0U) {
+        Debug_WriteString("RAW <NO DATA>");
+    }
+    Debug_WriteString("\r\nLISTEN RAW END count=");
+    Debug_WriteUInt(count);
+    Debug_WriteString("\r\n");
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  HAL_Init(); // STM32 基础初始化
+  DWT_Delay_Init(); // 软件I2C/RS485方向控制依赖微秒延时，需尽早初始化
+
+  // 仅仅初始化串口1 (PA9/PA10)
+  USART1_RawInit_115200_HSI();
+	
+  // 2. 初始化 GPIO，RS485 方向控制引脚所在的 PCF8574 (I2C)
+  MX_GPIO_Init();
+  PCF8574_SoftI2C_Init();
+
+  
+  // 3. 初始化串口 2 (控制云台的 RS485 接口)
+  USART2_RawInit(PTZ_UART_DEFAULT_BAUDRATE);
+
+
+  // 4. 设置默认接收状态，防止总线冲突
+  Set_RS485_Direction(0);
+
+  Debug_WriteString("\r\n[CMD] USART1 RX ready on PA10, baud=115200.\r\n");
+  Debug_WriteString("[CMD] Send: PAN <angle>, TILT <angle>, GOTO <pan> <tilt>, BAUD [9600|115200], GET [RAW|PAN|TILT], RETURN [RT|QUERY], LISTEN RAW, HOME, ZERO, STOP\r\n");
+
+  while (1)
+  {
+    Heartbeat_Service();
+    CommandLine_Service();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+/**
+ * @brief  初始化 Cortex-M7 DWT 周期计数器。
+ * @note   delay_us() 依赖 CYCCNT。如果不显式打开，部分调试/启动环境下计数器可能不走。
+ */
+static void DWT_Delay_Init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+
+static void USART2_RawInit(uint32_t baudrate)
+{
+    if (baudrate == 0U) {
+        baudrate = PTZ_UART_DEFAULT_BAUDRATE;
+    }
+
+    ptz_uart_baudrate = baudrate;
+
+    // 1. 开启时钟
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_USART2_CLK_ENABLE();
+
+    // 2. 配置 PA2 (TX) 和 PA3 (RX) 为复用功能
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2; // USART2 复用映射
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // 3. 寄存器配置波特率 (USART2 时钟源为 HSI 64MHz)
+    CLEAR_BIT(USART2->CR1, USART_CR1_UE);
+
+    USART2->BRR = (PTZ_UART_CLOCK_HZ + (baudrate / 2U)) / baudrate;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE; // 使能发送和接收
+    SET_BIT(USART2->CR1, USART_CR1_UE);        // 开启串口
+}
+
+/**
+ * @brief  微秒级延时函数 (使用 DWT Cycle Count 实现高精度延时)
+ * @param  us: 延时微秒数
+ * @note   在 USER CODE 2 中调用 DWT_Delay_Init() 后使用。
+ */
+void delay_us(uint32_t us)
+{
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+        DWT_Delay_Init();
+    }
+
+    uint32_t cycles = us * (SystemCoreClock / 1000000U);
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < cycles) {
+        // 空循环等待
+    }
+}
+
+/**
+ * @brief  重定向 printf 到 USART1
+ * @note   同时提供 fputc 和 __io_putchar，兼容 Keil MicroLIB / 标准库 / GCC 风格 retarget。
+ */
+static int Debug_PutChar(int ch)
+{
+    // 【关键修复】：永远使用最底层的寄存器发串口，保证在任何情况下都能看到打印！
+    USART1_RawWriteChar((char)ch);
+    return ch;
+}
+
+int fputc(int ch, FILE *f)
+{
+    (void)f;
+    return Debug_PutChar(ch);
+}
+
+int __io_putchar(int ch)
+{
+    return Debug_PutChar(ch);
+}
+
+#if !defined(__MICROLIB)
+// 实现标准库需要的 stub 函数，替代半主机实现
+struct __FILE { int handle; };
+__attribute__((weak)) int _sys_open(const char *name, int openmode) { (void)name; (void)openmode; return -1; }
+__attribute__((weak)) int _sys_close(int fh) { (void)fh; return 0; }
+__attribute__((weak)) int _sys_read(int fh, unsigned char *buf, int len) { (void)fh; (void)buf; (void)len; return -1; }
+__attribute__((weak)) int _sys_write(int fh, const unsigned char *buf, int len) { (void)fh; (void)buf; (void)len; return -1; }
+__attribute__((weak)) int _sys_seek(int fh, long pos) { (void)fh; (void)pos; return -1; }
+__attribute__((weak)) long _sys_flen(int fh) { (void)fh; return 0; }
+__attribute__((weak)) int _sys_istty(int fh) { (void)fh; return 0; }
+__attribute__((weak)) void _ttywrch(int ch) { (void)ch; }
+__attribute__((weak)) void _sys_exit(int x) { (void)x; while(1); }
+#endif
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  // 强行重新初始化底层串口并疯狂报警
+  USART1_RawInit_115200_HSI();
+  printf("\r\n[FATAL ERROR] 糟糕！程序死机了，卡在了 Error_Handler！\r\n");
+  while (1)
+  {
+  }
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the HAL error name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
+/* EOF */
