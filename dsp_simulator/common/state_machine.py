@@ -1,4 +1,4 @@
-"""Pure DSP state-machine logic used by simulation and future deployment."""
+"""Pure, slot-driven DSP state machine shared by simulation and deployment."""
 
 from __future__ import annotations
 
@@ -7,53 +7,70 @@ from typing import Any
 
 from .definitions import UPLINK_MODE
 from .protocol import (
-    MODULE_DSP,
-    MODULE_GIMBAL,
-    MODULE_MMWAVE,
-    MODULE_PC,
-    MODULE_THZ,
-    PKT_GIMBAL_CMD,
-    PKT_GIMBAL_FB,
-    PKT_MMW_DETECT,
-    PKT_MMW_LINK_STATUS,
-    PKT_MMW_RF_CTRL,
-    PKT_THZ_PARAM,
-    PKT_THZ_STATUS,
-    PKT_UPLINK_STATE,
-    TRIGGER_EVENT,
-    TRIGGER_PERIODIC,
-    make_message,
+    MODULE_DSP, MODULE_GIMBAL, MODULE_MMWAVE, MODULE_PC, MODULE_THZ,
+    PKT_GIMBAL_CMD, PKT_GIMBAL_FB, PKT_MMW_DETECT, PKT_MMW_LINK_STATUS,
+    PKT_MMW_RF_CTRL, PKT_THZ_PARAM, PKT_THZ_STATUS, PKT_UPLINK_STATE,
+    TRIGGER_EVENT, TRIGGER_PERIODIC, make_message,
 )
+
+
+STATE_CODES = {
+    "IDLE": 0, "FAULT": 1, "S0": 2, "S1": 3, "S2": 4,
+    "S3": 5, "S4": 6, "S5": 7, "S6": 8, "S7": 9,
+}
+
+REASON_TEXT = {
+    "NONE": "无状态变化", "START": "启动状态机", "RESET": "人工复位",
+    "SELF_OK": "模块自检通过", "SELF_FAIL": "模块自检超时",
+    "TARGET_STABLE": "毫米波目标稳定", "TARGET_LOST": "毫米波目标丢失",
+    "GIMBAL_ALIGNED": "云台到位", "ALIGN_TIMEOUT": "云台对准超时",
+    "THZ_LOCKED": "THz锁定成功", "CAPTURE_TIMEOUT": "THz捕获超时",
+    "TRACK_LOST": "THz跟踪失锁", "REACQUIRE_OK": "THz快速重捕获成功",
+    "REACQUIRE_TIMEOUT": "THz快速重捕获超时",
+    "REACQUIRE_REALIGN": "目标移动，需要重新对准",
+    "MMWAVE_RECOVERED": "毫米波链路恢复", "FALLBACK_TIMEOUT": "毫米波回退超时",
+    "MODULE_FAULT": "关键模块故障", "RECOVERY_OK_TARGET": "模块恢复且目标有效",
+    "RECOVERY_OK_SEARCH": "模块恢复并返回搜索", "RECOVERY_TIMEOUT": "模块恢复失败",
+}
+
+MODULE_BITS = {MODULE_MMWAVE: 1 << 0, MODULE_THZ: 1 << 1, MODULE_GIMBAL: 1 << 2}
 
 
 @dataclass
 class StateMachineConfig:
-    detect_window_slots: int = 3
-    capture_min_slots: int = 2
+    slot_period_ms: int = 100
+    input_max_age_slots: int = 3
+    self_check_stable_slots: int = 2
+    self_check_timeout_slots: int = 30
+    detect_stable_slots: int = 3
+    coarse_stable_slots: int = 2
+    coarse_timeout_slots: int = 30
+    target_lost_tolerance_slots: int = 2
+    position_error_threshold_mdeg: int = 500
+    capture_lock_stable_slots: int = 2
     capture_timeout_slots: int = 20
-    capture_target_lost_tolerance_slots: int = 2
-    capture_gimbal_error_tolerance_slots: int = 2
-    thz_capture_bad_window_slots: int = 3
-    thz_loss_window_slots: int = 3
-    tracking_target_lost_tolerance_slots: int = 3
-    tracking_gimbal_error_tolerance_slots: int = 3
-    thz_quality_threshold: float = 0.4
-    mmwave_snr_threshold: float = 10.0
-    mmwave_link_quality_threshold: float = 0.3
-    critical_offline_tolerance_slots: int = 3
+    thz_quality_threshold: int = 400
+    tracking_loss_slots: int = 3
     fallback_restore_slots: int = 3
     fallback_timeout_slots: int = 30
-    coarse_min_slots: int = 2
-    coarse_target_lost_tolerance_slots: int = 2
-    position_error_threshold_deg: float = 0.5
-    default_gimbal_speed: float = 20.0
+    mmwave_quality_threshold: int = 300
+    reacquire_lock_stable_slots: int = 2
+    reacquire_timeout_slots: int = 20
+    reacquire_target_delta_mdeg: int = 2000
+    recovery_stable_slots: int = 3
+    recovery_query_period_slots: int = 5
+    recovery_timeout_slots: int = 100
+    recovery_max_attempts: int = 3
+    default_gimbal_speed_mdeg_s: int = 20000
 
 
 @dataclass
 class StepResult:
     state: str
     previous_state: str
-    transition: str | None
+    reason: str = "NONE"
+    transition: str | None = None
+    fault_mask: int = 0
     outputs: list[dict[str, Any]] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -62,494 +79,247 @@ class StepResult:
 class DspStateMachine:
     def __init__(self, config: StateMachineConfig | None = None):
         self.config = config or StateMachineConfig()
-        self.state = "S0"
-        self.mmwave_valid_count = 0
-        self.coarse_slots = 0
-        self.coarse_target_lost_count = 0
-        self.capture_slots = 0
-        self.capture_target_lost_count = 0
-        self.capture_gimbal_error_count = 0
-        self.capture_thz_quality_bad_count = 0
-        self.tracking_thz_unlock_count = 0
-        self.tracking_thz_quality_bad_count = 0
-        self.tracking_target_lost_count = 0
-        self.tracking_gimbal_error_count = 0
-        self.critical_offline_count = 0
-        self.fallback_restore_count = 0
-        self.fallback_slots = 0
-        self.last_target = {"azimuth_deg": 0.0, "elevation_deg": 0.0}
-        self.last_diagnostics: dict[str, Any] = {}
+        self.state = "IDLE"
+        self.previous_state = "IDLE"
+        self.state_enter_slot = 0
+        self.fault_mask = 0
+        self.last_target = {"azimuth_mdeg": 0, "elevation_mdeg": 0}
+        self.lock_target = dict(self.last_target)
+        self.counters: dict[str, int] = {}
+        self.recovery_attempts = 0
+        self.last_recovery_action_slot = 0
 
-    def step(self, slot_id: int, packets: dict[str, dict[str, Any]]) -> StepResult:
+    def step(self, slot_id: int, packets: dict[str, Any]) -> StepResult:
         previous = self.state
-        transition = None
+        reason = "NONE"
         alerts: list[str] = []
-        diagnostics: dict[str, Any] = {}
 
-        health = packets.get("health", {})
-        health_detail = packets.get("health_detail", {})
-        mmwave_online = health.get(MODULE_MMWAVE, False)
-        gimbal_online = health.get(MODULE_GIMBAL, False)
-        thz_online = health.get(MODULE_THZ, False)
-        offline_modules = self._offline_modules(health)
-        if offline_modules:
-            self.critical_offline_count += 1
-        else:
-            self.critical_offline_count = 0
-        diagnostics["health"] = {
-            "offline_modules": offline_modules,
-            "critical_offline_count": self.critical_offline_count,
-            "module_detail": health_detail,
+        if packets.get("reset"):
+            self._reset(slot_id)
+            reason = "RESET"
+        elif self.state == "IDLE":
+            if packets.get("start"):
+                self._transition("S0", slot_id)
+                reason = "START"
+        elif self.state != "FAULT":
+            snapshot = self._normalize_inputs(packets)
+            self.fault_mask = snapshot["fault_mask"]
+            if self.state in {"S1", "S2", "S3", "S4", "S5", "S6"} and self.fault_mask:
+                self._transition("S7", slot_id)
+                self.recovery_attempts = 0
+                self.last_recovery_action_slot = slot_id
+                reason = "MODULE_FAULT"
+            else:
+                reason = self._run_state(slot_id, snapshot)
+
+        transition = REASON_TEXT[reason] if reason != "NONE" else None
+        diagnostics = {
+            "state_code": STATE_CODES[self.state],
+            "state_age_slots": slot_id - self.state_enter_slot,
+            "fault_mask": self.fault_mask,
+            "counters": dict(self.counters),
+            "last_target": dict(self.last_target),
+            "reason": reason,
         }
-        mmwave = packets.get(PKT_MMW_DETECT, {}) if mmwave_online else {}
-        mmwave_link = packets.get(PKT_MMW_LINK_STATUS, {}) if mmwave_online else {}
-        gimbal = packets.get(PKT_GIMBAL_FB, {}) if gimbal_online else {}
-        thz = packets.get(PKT_THZ_STATUS, {}) if thz_online else {}
+        if self.state == "FAULT":
+            alerts.append(REASON_TEXT.get(reason, "状态机进入安全故障态"))
+        outputs = self._build_outputs(slot_id, previous, reason, transition, diagnostics)
+        self.previous_state = previous
+        return StepResult(
+            state=self.state, previous_state=previous, reason=reason,
+            transition=transition, fault_mask=self.fault_mask, outputs=outputs,
+            alerts=alerts, diagnostics=diagnostics,
+        )
 
-        if mmwave.get("target_valid"):
+    def _run_state(self, slot_id: int, data: dict[str, Any]) -> str:
+        age = slot_id - self.state_enter_slot
+        if data["target_fresh"]:
             self.last_target = {
-                "azimuth_deg": float(mmwave.get("azimuth_deg", self.last_target["azimuth_deg"])),
-                "elevation_deg": float(mmwave.get("elevation_deg", self.last_target["elevation_deg"])),
+                "azimuth_mdeg": data["azimuth_mdeg"],
+                "elevation_mdeg": data["elevation_mdeg"],
             }
 
-        if (
-            self.state != "S0"
-            and offline_modules
-            and self.critical_offline_count >= self.config.critical_offline_tolerance_slots
-        ):
-            self._set_state("S0")
-            transition = "关键模块离线: " + ", ".join(offline_modules)
-            alerts.append(self._format_health_alert(diagnostics["health"]))
-
-        elif self.state == "S0":
-            if self._all_modules_online(health):
-                self._set_state("S1")
-                transition = "自检通过"
+        if self.state == "S0":
+            if data["all_healthy"]:
+                if self._count("self_ok", True) >= self.config.self_check_stable_slots:
+                    self._transition("S1", slot_id)
+                    return "SELF_OK"
             else:
-                alerts.append("模块离线/未知: " + ", ".join(offline_modules))
+                self._count("self_ok", False)
+            if age >= self.config.self_check_timeout_slots:
+                self._transition("FAULT", slot_id)
+                return "SELF_FAIL"
 
         elif self.state == "S1":
-            if mmwave_online and self._mmwave_target_quality_ok(mmwave):
-                self.mmwave_valid_count += 1
-            else:
-                self.mmwave_valid_count = 0
-            if self.mmwave_valid_count >= self.config.detect_window_slots:
-                self._set_state("S2")
-                transition = "检测到稳定目标"
+            if self._count("target", data["target_fresh"]) >= self.config.detect_stable_slots:
+                self._transition("S2", slot_id)
+                return "TARGET_STABLE"
 
         elif self.state == "S2":
-            self.coarse_slots += 1
-            if mmwave.get("target_valid"):
-                self.coarse_target_lost_count = 0
-            else:
-                self.coarse_target_lost_count += 1
-
-            position_error = float(gimbal.get("position_error_deg", float("inf")))
-            if self.coarse_target_lost_count > self.config.coarse_target_lost_tolerance_slots:
-                self._set_state("S1")
-                transition = "粗对准目标丢失"
-            elif (
-                self.coarse_slots >= self.config.coarse_min_slots
-                and mmwave.get("target_valid")
-                and self._gimbal_feedback_ok(gimbal)
-                and position_error <= self.config.position_error_threshold_deg
-            ):
-                self._set_state("S3")
-                transition = "云台到位"
+            if self._count("target_lost", not data["target_fresh"]) >= self.config.target_lost_tolerance_slots:
+                self._transition("S1", slot_id)
+                return "TARGET_LOST"
+            aligned = data["gimbal_fresh"] and data["gimbal_in_position"] and (
+                data["position_error_mdeg"] <= self.config.position_error_threshold_mdeg
+            )
+            if self._count("aligned", aligned) >= self.config.coarse_stable_slots:
+                self._transition("S3", slot_id)
+                return "GIMBAL_ALIGNED"
+            if age >= self.config.coarse_timeout_slots:
+                self._transition("S1", slot_id)
+                return "ALIGN_TIMEOUT"
 
         elif self.state == "S3":
-            self.capture_slots += 1
-
-            mmwave_target_ok = bool(mmwave.get("target_valid"))
-            gimbal_position_error = float(gimbal.get("position_error_deg", float("inf")))
-            gimbal_position_ok = (
-                self._gimbal_feedback_ok(gimbal)
-                and gimbal_position_error <= self.config.position_error_threshold_deg
-            )
-            thz_lock_ok = bool(thz.get("lock_flag"))
-            thz_link_quality = float(thz.get("link_quality", 0.0 if not thz_online else 1.0))
-            thz_quality_ok = thz_online and thz_link_quality >= self.config.thz_quality_threshold
-
-            if mmwave_online and mmwave_target_ok:
-                self.capture_target_lost_count = 0
-            else:
-                self.capture_target_lost_count += 1
-
-            if gimbal_online and gimbal_position_ok:
-                self.capture_gimbal_error_count = 0
-            else:
-                self.capture_gimbal_error_count += 1
-
-            if thz_quality_ok:
-                self.capture_thz_quality_bad_count = 0
-            else:
-                self.capture_thz_quality_bad_count += 1
-
-            diagnostics["capture"] = {
-                "capture_slots": self.capture_slots,
-                "mmwave_online": mmwave_online,
-                "mmwave_target_valid": mmwave_target_ok,
-                "target_lost_count": self.capture_target_lost_count,
-                "gimbal_online": gimbal_online,
-                "gimbal_fault_mode": gimbal.get("fault_mode", "unknown"),
-                "gimbal_in_position": bool(gimbal.get("in_position")),
-                "gimbal_position_error_deg": None if gimbal_position_error == float("inf") else gimbal_position_error,
-                "gimbal_error_count": self.capture_gimbal_error_count,
-                "thz_online": thz_online,
-                "thz_lock_flag": thz_lock_ok,
-                "thz_link_quality": thz_link_quality,
-                "thz_quality_bad_count": self.capture_thz_quality_bad_count,
-            }
-
-            if not thz_online:
-                self._set_state("S5")
-                transition = "捕获失败: THz模块离线"
-            elif self.capture_target_lost_count > self.config.capture_target_lost_tolerance_slots:
-                self._set_state("S5")
-                transition = "捕获失败: 毫米波目标丢失"
-            elif self.capture_gimbal_error_count > self.config.capture_gimbal_error_tolerance_slots:
-                self._set_state("S5")
-                transition = "捕获失败: 云台偏离"
-            elif self.capture_thz_quality_bad_count >= self.config.thz_capture_bad_window_slots:
-                self._set_state("S5")
-                transition = "捕获失败: THz链路质量低"
-            elif (
-                self.capture_slots >= self.config.capture_min_slots
-                and mmwave_target_ok
-                and gimbal_position_ok
-                and thz_lock_ok
-                and thz_quality_ok
-            ):
-                self._set_state("S4")
-                transition = "太赫兹锁定成功"
-            elif self.capture_slots > self.config.capture_timeout_slots:
-                self._set_state("S5")
-                transition = "捕获超时: THz未锁定"
-
-            if transition and self.state == "S5":
-                alerts.append(self._format_capture_alert(diagnostics["capture"]))
+            locked = data["thz_fresh"] and data["thz_locked"] and data["thz_quality"] >= self.config.thz_quality_threshold
+            if self._count("capture_lock", locked) >= self.config.capture_lock_stable_slots:
+                self.lock_target = dict(self.last_target)
+                self._transition("S4", slot_id)
+                return "THZ_LOCKED"
+            if age >= self.config.capture_timeout_slots:
+                self._transition("S5", slot_id)
+                return "CAPTURE_TIMEOUT"
 
         elif self.state == "S4":
-            mmwave_target_ok = bool(mmwave.get("target_valid"))
-            gimbal_position_error = float(gimbal.get("position_error_deg", float("inf")))
-            gimbal_position_ok = (
-                self._gimbal_feedback_ok(gimbal)
-                and gimbal_position_error <= self.config.position_error_threshold_deg
-            )
-            thz_lock_ok = bool(thz.get("lock_flag"))
-            thz_link_quality = float(thz.get("link_quality", 0.0 if not thz_online else 1.0))
-            thz_quality_ok = thz_online and thz_link_quality >= self.config.thz_quality_threshold
-
-            if thz_online and thz_lock_ok:
-                self.tracking_thz_unlock_count = 0
-            else:
-                self.tracking_thz_unlock_count += 1
-
-            if thz_quality_ok:
-                self.tracking_thz_quality_bad_count = 0
-            else:
-                self.tracking_thz_quality_bad_count += 1
-
-            if mmwave_online and mmwave_target_ok:
-                self.tracking_target_lost_count = 0
-            else:
-                self.tracking_target_lost_count += 1
-
-            if gimbal_online and gimbal_position_ok:
-                self.tracking_gimbal_error_count = 0
-            else:
-                self.tracking_gimbal_error_count += 1
-
-            diagnostics["tracking"] = {
-                "mmwave_online": mmwave_online,
-                "mmwave_target_valid": mmwave_target_ok,
-                "target_lost_count": self.tracking_target_lost_count,
-                "gimbal_online": gimbal_online,
-                "gimbal_fault_mode": gimbal.get("fault_mode", "unknown"),
-                "gimbal_in_position": bool(gimbal.get("in_position")),
-                "gimbal_position_error_deg": None if gimbal_position_error == float("inf") else gimbal_position_error,
-                "gimbal_error_count": self.tracking_gimbal_error_count,
-                "thz_online": thz_online,
-                "thz_lock_flag": thz_lock_ok,
-                "thz_unlock_count": self.tracking_thz_unlock_count,
-                "thz_link_quality": thz_link_quality,
-                "thz_quality_bad_count": self.tracking_thz_quality_bad_count,
-            }
-
-            if not thz_online:
-                self._set_state("S5")
-                transition = "跟踪失败: THz模块离线"
-            elif self.tracking_thz_unlock_count >= self.config.thz_loss_window_slots:
-                self._set_state("S5")
-                transition = "跟踪失败: THz失锁"
-            elif self.tracking_thz_quality_bad_count >= self.config.thz_loss_window_slots:
-                self._set_state("S5")
-                transition = "跟踪失败: THz链路质量低"
-            elif self.tracking_gimbal_error_count > self.config.tracking_gimbal_error_tolerance_slots:
-                self._set_state("S5")
-                transition = "跟踪失败: 云台跟踪偏离"
-            elif self.tracking_target_lost_count > self.config.tracking_target_lost_tolerance_slots:
-                self._set_state("S5")
-                transition = "跟踪失败: 毫米波辅助目标丢失"
-
-            if transition and self.state == "S5":
-                alerts.append(self._format_tracking_alert(diagnostics["tracking"]))
+            tracking_ok = data["thz_fresh"] and data["thz_locked"] and data["thz_quality"] >= self.config.thz_quality_threshold
+            if self._count("track_lost", not tracking_ok) >= self.config.tracking_loss_slots:
+                self.lock_target = dict(self.last_target)
+                self._transition("S6", slot_id)
+                return "TRACK_LOST"
 
         elif self.state == "S5":
-            self.fallback_slots += 1
+            recovered = data["target_fresh"] and data["mmwave_uplink_ready"] and data["mmwave_quality"] >= self.config.mmwave_quality_threshold
+            if self._count("fallback_recover", recovered) >= self.config.fallback_restore_slots:
+                self._transition("S2", slot_id)
+                return "MMWAVE_RECOVERED"
+            if age >= self.config.fallback_timeout_slots:
+                self._transition("S1", slot_id)
+                return "FALLBACK_TIMEOUT"
 
-            target_quality_ok = mmwave_online and self._mmwave_target_quality_ok(mmwave)
-            mmwave_link_quality = float(mmwave_link.get("link_quality", 0.0))
-            mmwave_link_ok = (
-                mmwave_online
-                and bool(mmwave_link.get("uplink_ready"))
-                and mmwave_link_quality >= self.config.mmwave_link_quality_threshold
-            )
-            gimbal_fault_mode = gimbal.get(
-                "fault_mode",
-                health_detail.get(MODULE_GIMBAL, {}).get("fault_code", "unknown"),
-            )
-            gimbal_controllable = gimbal_online and gimbal_fault_mode == "none"
-            restore_ready = target_quality_ok and gimbal_controllable and thz_online
+        elif self.state == "S6":
+            if data["target_fresh"] and self._target_moved():
+                self._transition("S2", slot_id)
+                return "REACQUIRE_REALIGN"
+            locked = data["thz_fresh"] and data["thz_locked"] and data["thz_quality"] >= self.config.thz_quality_threshold
+            if self._count("reacquire_lock", locked) >= self.config.reacquire_lock_stable_slots:
+                self._transition("S4", slot_id)
+                return "REACQUIRE_OK"
+            if age >= self.config.reacquire_timeout_slots:
+                self._transition("S5", slot_id)
+                return "REACQUIRE_TIMEOUT"
 
-            if restore_ready:
-                self.fallback_restore_count += 1
+        elif self.state == "S7":
+            if data["all_healthy"]:
+                if self._count("recovery_ok", True) >= self.config.recovery_stable_slots:
+                    self.fault_mask = 0
+                    if data["target_fresh"]:
+                        self._transition("S2", slot_id)
+                        return "RECOVERY_OK_TARGET"
+                    self._transition("S1", slot_id)
+                    return "RECOVERY_OK_SEARCH"
             else:
-                self.fallback_restore_count = 0
+                self._count("recovery_ok", False)
+            if age and age % self.config.recovery_query_period_slots == 0:
+                self.recovery_attempts += 1
+                self.last_recovery_action_slot = slot_id
+            if age >= self.config.recovery_timeout_slots or self.recovery_attempts >= self.config.recovery_max_attempts:
+                self._transition("FAULT", slot_id)
+                return "RECOVERY_TIMEOUT"
 
-            diagnostics["fallback"] = {
-                "fallback_slots": self.fallback_slots,
-                "mmwave_online": mmwave_online,
-                "mmwave_target_valid": bool(mmwave.get("target_valid")),
-                "mmwave_snr_db": float(mmwave.get("snr_db", 0.0)),
-                "mmwave_target_quality_ok": target_quality_ok,
-                "restore_count": self.fallback_restore_count,
-                "mmwave_comm_enable": bool(mmwave_link.get("comm_enable")),
-                "mmwave_uplink_ready": bool(mmwave_link.get("uplink_ready")),
-                "mmwave_link_quality": mmwave_link_quality,
-                "mmwave_link_ok": mmwave_link_ok,
-                "gimbal_online": gimbal_online,
-                "gimbal_fault_mode": gimbal_fault_mode,
-                "gimbal_controllable": gimbal_controllable,
-                "thz_online": thz_online,
-                "restore_ready": restore_ready,
-            }
+        return "NONE"
 
-            if self.fallback_restore_count >= self.config.fallback_restore_slots:
-                self._set_state("S2")
-                transition = "毫米波稳定恢复"
-            elif self.fallback_slots > self.config.fallback_timeout_slots:
-                self._set_state("S1")
-                transition = "长时间无恢复"
-                alerts.append(self._format_fallback_alert(diagnostics["fallback"]))
+    def _normalize_inputs(self, packets: dict[str, Any]) -> dict[str, Any]:
+        health = packets.get("health", {})
+        explicit_mask = int(packets.get("fault_mask", 0) or 0)
+        health_mask = 0
+        for module, bit in MODULE_BITS.items():
+            if not bool(health.get(module, False)):
+                health_mask |= bit
 
-        self.last_diagnostics = diagnostics
-        outputs = self._build_outputs(slot_id, previous, transition, alerts, diagnostics)
-        return StepResult(
-            state=self.state,
-            previous_state=previous,
-            transition=transition,
-            outputs=outputs,
-            alerts=alerts,
-            diagnostics=diagnostics,
-        )
+        mmwave = packets.get(PKT_MMW_DETECT, {})
+        mmwave_link = packets.get(PKT_MMW_LINK_STATUS, {})
+        gimbal = packets.get(PKT_GIMBAL_FB, {})
+        thz = packets.get(PKT_THZ_STATUS, {})
+        target_fresh = self._fresh(mmwave) and bool(mmwave.get("target_valid", False))
+        return {
+            "fault_mask": explicit_mask | health_mask,
+            "all_healthy": (explicit_mask | health_mask) == 0,
+            "target_fresh": target_fresh,
+            "azimuth_mdeg": int(mmwave.get("azimuth_mdeg", self.last_target["azimuth_mdeg"])),
+            "elevation_mdeg": int(mmwave.get("elevation_mdeg", self.last_target["elevation_mdeg"])),
+            "mmwave_uplink_ready": bool(mmwave_link.get("uplink_ready", False)) and self._fresh(mmwave_link),
+            "mmwave_quality": int(mmwave_link.get("link_quality", 0) or 0),
+            "gimbal_fresh": self._fresh(gimbal),
+            "gimbal_in_position": bool(gimbal.get("in_position", False)),
+            "position_error_mdeg": int(gimbal.get("position_error_mdeg", 2**31 - 1)),
+            "thz_fresh": self._fresh(thz),
+            "thz_locked": bool(thz.get("lock_flag", False)),
+            "thz_quality": int(thz.get("link_quality", 0) or 0),
+        }
 
-    def _set_state(self, new_state: str) -> None:
-        old = self.state
-        self.state = new_state
-        if old != new_state:
-            if new_state == "S1":
-                self.mmwave_valid_count = 0
-            if new_state == "S0":
-                self.mmwave_valid_count = 0
-                self.coarse_slots = 0
-                self.coarse_target_lost_count = 0
-                self.capture_slots = 0
-                self.capture_target_lost_count = 0
-                self.capture_gimbal_error_count = 0
-                self.capture_thz_quality_bad_count = 0
-                self.tracking_thz_unlock_count = 0
-                self.tracking_thz_quality_bad_count = 0
-                self.tracking_target_lost_count = 0
-                self.tracking_gimbal_error_count = 0
-                self.fallback_slots = 0
-                self.fallback_restore_count = 0
-            if new_state == "S2":
-                self.coarse_slots = 0
-                self.coarse_target_lost_count = 0
-            if new_state == "S3":
-                self.capture_slots = 0
-                self.capture_target_lost_count = 0
-                self.capture_gimbal_error_count = 0
-                self.capture_thz_quality_bad_count = 0
-            if new_state == "S4":
-                self.tracking_thz_unlock_count = 0
-                self.tracking_thz_quality_bad_count = 0
-                self.tracking_target_lost_count = 0
-                self.tracking_gimbal_error_count = 0
-            if new_state == "S5":
-                self.fallback_slots = 0
-                self.fallback_restore_count = 0
+    def _fresh(self, payload: dict[str, Any]) -> bool:
+        return bool(payload.get("valid", True)) and int(payload.get("age_slots", 0) or 0) <= self.config.input_max_age_slots
 
-    def _all_modules_online(self, health: dict[str, bool]) -> bool:
-        return not self._offline_modules(health)
-
-    def _offline_modules(self, health: dict[str, bool]) -> list[str]:
-        return [module for module in (MODULE_GIMBAL, MODULE_MMWAVE, MODULE_THZ) if not health.get(module, False)]
-
-    def _mmwave_target_quality_ok(self, mmwave: dict[str, Any]) -> bool:
-        snr_db = float(mmwave.get("snr_db", self.config.mmwave_snr_threshold))
-        return bool(mmwave.get("target_valid")) and snr_db >= self.config.mmwave_snr_threshold
-
-    def _gimbal_feedback_ok(self, gimbal: dict[str, Any]) -> bool:
-        return bool(gimbal.get("in_position")) and gimbal.get("fault_mode", "none") == "none"
-
-    def _format_capture_alert(self, capture: dict[str, Any]) -> str:
+    def _target_moved(self) -> bool:
         return (
-            "S3诊断: "
-            f"mmwave_online={capture['mmwave_online']}, "
-            f"target_valid={capture['mmwave_target_valid']}, "
-            f"target_lost_count={capture['target_lost_count']}, "
-            f"gimbal_online={capture['gimbal_online']}, "
-            f"gimbal_fault_mode={capture['gimbal_fault_mode']}, "
-            f"in_position={capture['gimbal_in_position']}, "
-            f"position_error_deg={capture['gimbal_position_error_deg']}, "
-            f"gimbal_error_count={capture['gimbal_error_count']}, "
-            f"thz_online={capture['thz_online']}, "
-            f"lock_flag={capture['thz_lock_flag']}, "
-            f"link_quality={capture['thz_link_quality']}, "
-            f"quality_bad_count={capture['thz_quality_bad_count']}"
+            abs(self.last_target["azimuth_mdeg"] - self.lock_target["azimuth_mdeg"]) > self.config.reacquire_target_delta_mdeg
+            or abs(self.last_target["elevation_mdeg"] - self.lock_target["elevation_mdeg"]) > self.config.reacquire_target_delta_mdeg
         )
 
-    def _format_tracking_alert(self, tracking: dict[str, Any]) -> str:
-        return (
-            "S4诊断: "
-            f"mmwave_online={tracking['mmwave_online']}, "
-            f"target_valid={tracking['mmwave_target_valid']}, "
-            f"target_lost_count={tracking['target_lost_count']}, "
-            f"gimbal_online={tracking['gimbal_online']}, "
-            f"gimbal_fault_mode={tracking['gimbal_fault_mode']}, "
-            f"in_position={tracking['gimbal_in_position']}, "
-            f"position_error_deg={tracking['gimbal_position_error_deg']}, "
-            f"gimbal_error_count={tracking['gimbal_error_count']}, "
-            f"thz_online={tracking['thz_online']}, "
-            f"lock_flag={tracking['thz_lock_flag']}, "
-            f"unlock_count={tracking['thz_unlock_count']}, "
-            f"link_quality={tracking['thz_link_quality']}, "
-            f"quality_bad_count={tracking['thz_quality_bad_count']}"
-        )
+    def _count(self, key: str, condition: bool) -> int:
+        self.counters[key] = self.counters.get(key, 0) + 1 if condition else 0
+        return self.counters[key]
 
-    def _format_fallback_alert(self, fallback: dict[str, Any]) -> str:
-        return (
-            "S5诊断: "
-            f"mmwave_online={fallback['mmwave_online']}, "
-            f"target_valid={fallback['mmwave_target_valid']}, "
-            f"snr_db={fallback['mmwave_snr_db']}, "
-            f"target_quality_ok={fallback['mmwave_target_quality_ok']}, "
-            f"restore_count={fallback['restore_count']}, "
-            f"mmwave_uplink_ready={fallback['mmwave_uplink_ready']}, "
-            f"mmwave_link_quality={fallback['mmwave_link_quality']}, "
-            f"mmwave_link_ok={fallback['mmwave_link_ok']}, "
-            f"gimbal_online={fallback['gimbal_online']}, "
-            f"gimbal_fault_mode={fallback['gimbal_fault_mode']}, "
-            f"gimbal_controllable={fallback['gimbal_controllable']}, "
-            f"thz_online={fallback['thz_online']}, "
-            f"restore_ready={fallback['restore_ready']}"
-        )
+    def _transition(self, state: str, slot_id: int) -> None:
+        self.state = state
+        self.state_enter_slot = slot_id
+        self.counters.clear()
 
-    def _format_health_alert(self, health: dict[str, Any]) -> str:
-        return (
-            "健康状态诊断: "
-            f"offline_modules={health['offline_modules']}, "
-            f"critical_offline_count={health['critical_offline_count']}"
-        )
+    def _reset(self, slot_id: int) -> None:
+        self.state = "IDLE"
+        self.state_enter_slot = slot_id
+        self.fault_mask = 0
+        self.counters.clear()
+        self.recovery_attempts = 0
 
-    def _build_outputs(
-        self,
-        slot_id: int,
-        previous_state: str,
-        transition: str | None,
-        alerts: list[str],
-        diagnostics: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        outputs: list[dict[str, Any]] = []
-
-        scan_mode = {
-            "S0": "idle",
-            "S1": "search",
-            "S2": "coarse",
-            "S3": "capture_assist",
-            "S4": "assist_tracking",
-            "S5": "fallback",
-        }.get(self.state, "idle")
-        outputs.append(make_message(
-            MODULE_DSP,
-            MODULE_MMWAVE,
-            PKT_MMW_RF_CTRL,
-            {
-                "rf_enable": self.state in {"S1", "S2", "S3", "S4", "S5"},
-                "sense_enable": self.state in {"S1", "S2", "S3", "S4", "S5"},
-                "comm_enable": self.state in {"S1", "S2", "S5"},
-                "scan_mode": scan_mode,
-                "beam_id": 0,
-                "gain_index": 1,
-                "comm_rate_level": 1 if self.state in {"S1", "S2", "S5"} else 0,
-                "comm_modulation_order": 2 if self.state in {"S1", "S2", "S5"} else 0,
-            },
-            slot_id=slot_id,
-        ))
-
-        outputs.append(make_message(
-            MODULE_DSP,
-            MODULE_GIMBAL,
-            PKT_GIMBAL_CMD,
-            {
-                "cmd_seq": slot_id,
-                "target_azimuth_deg": self.last_target["azimuth_deg"],
-                "target_elevation_deg": self.last_target["elevation_deg"],
-                "angular_speed": self.config.default_gimbal_speed,
-                "fine_tune_enable": self.state == "S4",
-                "enable": self.state in {"S2", "S4"},
-            },
-            slot_id=slot_id,
-        ))
-
-        outputs.append(make_message(
-            MODULE_DSP,
-            MODULE_THZ,
-            PKT_THZ_PARAM,
-            {
-                "thz_enable": self.state in {"S3", "S4"},
-                "sense_enable": self.state in {"S3", "S4"},
-                "comm_enable": self.state == "S4",
-                "traffic_enable": self.state == "S4",
-                "rate_level": 1 if self.state in {"S3", "S4"} else 0,
-                "modulation_order": 4 if self.state in {"S3", "S4"} else 0,
-                "capture_timeout_slot": self.config.capture_timeout_slots,
+    def _build_outputs(self, slot_id: int, previous_state: str, reason: str,
+                       transition: str | None, diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
+        active = self.state in {"S1", "S2", "S3", "S4", "S5", "S6"}
+        mmwave_comm = self.state in {"S1", "S2", "S5"}
+        gimbal_enable = self.state in {"S2", "S4", "S6"}
+        thz_enable = self.state in {"S3", "S4", "S6"}
+        recovery_action = self.fault_mask if self.state == "S7" and self.last_recovery_action_slot == slot_id else 0
+        outputs = [
+            make_message(MODULE_DSP, MODULE_MMWAVE, PKT_MMW_RF_CTRL, {
+                "rf_enable": active, "sense_enable": active, "comm_enable": mmwave_comm,
+                "scan_mode": {"S1": "search", "S2": "coarse", "S3": "capture_assist",
+                              "S4": "assist_tracking", "S5": "fallback", "S6": "reacquire_assist"}.get(self.state, "idle"),
+                "beam_id": 0, "gain_index": 1,
+                "comm_rate_level": 1 if mmwave_comm else 0,
+                "comm_modulation_order": 2 if mmwave_comm else 0,
+            }, slot_id=slot_id),
+            make_message(MODULE_DSP, MODULE_GIMBAL, PKT_GIMBAL_CMD, {
+                "cmd_seq": slot_id, "target_azimuth_mdeg": self.last_target["azimuth_mdeg"],
+                "target_elevation_mdeg": self.last_target["elevation_mdeg"],
+                "angular_speed_mdeg_s": self.config.default_gimbal_speed_mdeg_s,
+                "fine_tune_enable": self.state == "S4", "enable": gimbal_enable,
+            }, slot_id=slot_id),
+            make_message(MODULE_DSP, MODULE_THZ, PKT_THZ_PARAM, {
+                "thz_enable": thz_enable, "sense_enable": thz_enable,
+                "comm_enable": self.state == "S4", "traffic_enable": self.state == "S4",
+                "reacquire": self.state == "S6", "rate_level": 1 if thz_enable else 0,
+                "modulation_order": 4 if thz_enable else 0,
+                "capture_timeout_slots": self.config.capture_timeout_slots,
                 "tracking_threshold": self.config.thz_quality_threshold,
-            },
-            slot_id=slot_id,
-        ))
-
-        state_trigger_type = TRIGGER_EVENT if transition or alerts else TRIGGER_PERIODIC
-        state_trigger_reason = transition or "; ".join(alerts) or "slot_status"
-        outputs.append(make_message(
-            MODULE_DSP,
-            MODULE_PC,
-            PKT_UPLINK_STATE,
-            {
-                "state_id": self.state,
-                "previous_state": previous_state,
-                "uplink_mode": UPLINK_MODE[self.state],
-                "transition": transition,
-                "fallback_reason": transition if self.state == "S5" else "",
-                "restore_flag": transition == "毫米波稳定恢复",
-                "alerts": alerts,
-                "diagnostics": diagnostics,
-                "slot_id": slot_id,
-            },
-            slot_id=slot_id,
-            trigger_type=state_trigger_type,
-            trigger_reason=state_trigger_reason,
-        ))
+            }, slot_id=slot_id),
+        ]
+        outputs.append(make_message(MODULE_DSP, MODULE_PC, PKT_UPLINK_STATE, {
+            "state_id": self.state, "state_code": STATE_CODES[self.state],
+            "previous_state": previous_state, "reason": reason, "transition": transition,
+            "uplink_mode": UPLINK_MODE[self.state], "fault_mask": self.fault_mask,
+            "recovery_action_mask": recovery_action,
+            "fallback_reason": reason if self.state == "S5" else "",
+            "restore_flag": reason in {"MMWAVE_RECOVERED", "RECOVERY_OK_TARGET", "RECOVERY_OK_SEARCH"},
+            "diagnostics": diagnostics, "slot_id": slot_id,
+        }, slot_id=slot_id, trigger_type=TRIGGER_EVENT if reason != "NONE" else TRIGGER_PERIODIC,
+            trigger_reason=reason if reason != "NONE" else "slot_status"))
         return outputs

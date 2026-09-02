@@ -22,12 +22,12 @@ from common.transport import JsonLineServer, Peer
 @dataclass
 class GimbalState:
     online: bool = True
-    current_azimuth_deg: float = 0.0
-    current_elevation_deg: float = 0.0
-    target_azimuth_deg: float = 0.0
-    target_elevation_deg: float = 0.0
-    speed_limit_deg_s: float = 20.0
-    in_position_threshold_deg: float = 0.5
+    current_azimuth_mdeg: int = 0
+    current_elevation_mdeg: int = 0
+    target_azimuth_mdeg: int = 0
+    target_elevation_mdeg: int = 0
+    speed_limit_mdeg_s: int = 20000
+    in_position_threshold_mdeg: int = 500
     fault_mode: str = "none"
     drop_rate: float = 0.0
     last_slot_id: int = 0
@@ -35,40 +35,43 @@ class GimbalState:
     def apply_command(self, payload: dict) -> None:
         if not payload.get("enable", True):
             return
-        self.target_azimuth_deg = float(payload.get("target_azimuth_deg", self.target_azimuth_deg))
-        self.target_elevation_deg = float(payload.get("target_elevation_deg", self.target_elevation_deg))
-        self.speed_limit_deg_s = float(payload.get("angular_speed", self.speed_limit_deg_s))
+        self.target_azimuth_mdeg = int(payload.get("target_azimuth_mdeg", self.target_azimuth_mdeg))
+        self.target_elevation_mdeg = int(payload.get("target_elevation_mdeg", self.target_elevation_mdeg))
+        self.speed_limit_mdeg_s = int(payload.get("angular_speed_mdeg_s", self.speed_limit_mdeg_s))
 
     def step(self, slot_id: int, slot_hz: float = 10.0) -> None:
         delta_slots = max(1, slot_id - self.last_slot_id) if self.last_slot_id else 1
         self.last_slot_id = slot_id
         if not self.online or self.fault_mode in {"stuck", "offline"}:
             return
-        max_delta = self.speed_limit_deg_s / slot_hz * delta_slots
-        self.current_azimuth_deg = self._move(self.current_azimuth_deg, self.target_azimuth_deg, max_delta)
-        self.current_elevation_deg = self._move(self.current_elevation_deg, self.target_elevation_deg, max_delta)
+        max_delta = self.speed_limit_mdeg_s / slot_hz * delta_slots
+        self.current_azimuth_mdeg = self._move(self.current_azimuth_mdeg, self.target_azimuth_mdeg, int(max_delta))
+        self.current_elevation_mdeg = self._move(self.current_elevation_mdeg, self.target_elevation_mdeg, int(max_delta))
 
     @staticmethod
-    def _move(current: float, target: float, max_delta: float) -> float:
+    def _move(current: int, target: int, max_delta: int) -> int:
         diff = target - current
         if abs(diff) <= max_delta:
             return target
         return current + (max_delta if diff > 0 else -max_delta)
 
     def feedback_payload(self) -> dict:
-        err_az = self.target_azimuth_deg - self.current_azimuth_deg
-        err_el = self.target_elevation_deg - self.current_elevation_deg
+        err_az = self.target_azimuth_mdeg - self.current_azimuth_mdeg
+        err_el = self.target_elevation_mdeg - self.current_elevation_mdeg
         position_error = (err_az * err_az + err_el * err_el) ** 0.5
         return {
-            "current_azimuth_deg": round(self.current_azimuth_deg, 3),
-            "current_elevation_deg": round(self.current_elevation_deg, 3),
-            "angular_speed": self.speed_limit_deg_s,
+            "valid": True,
+            "seq": self.last_slot_id,
+            "age_slots": 0,
+            "current_azimuth_mdeg": self.current_azimuth_mdeg,
+            "current_elevation_mdeg": self.current_elevation_mdeg,
+            "angular_speed_mdeg_s": self.speed_limit_mdeg_s,
             "in_position": (
                 self.online
                 and self.fault_mode == "none"
-                and position_error <= self.in_position_threshold_deg
+                and position_error <= self.in_position_threshold_mdeg
             ),
-            "position_error_deg": round(position_error, 3),
+            "position_error_mdeg": int(round(position_error)),
             "fault_mode": self.fault_mode,
         }
 

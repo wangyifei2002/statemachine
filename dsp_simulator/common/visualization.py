@@ -10,13 +10,19 @@ from .definitions import PACKET_HIGHLIGHT_GROUPS, STATE_NAMES
 
 
 ACTIVE_GROUPS_BY_STATE = {
+    "IDLE": {"state_report"},
+    "FAULT": {"state_report"},
     "S0": {"clock", "sync", "state_report"},
     "S1": {"mmwave", "perception", "mmwave_comm", "server", "state_report"},
     "S2": {"mmwave", "perception", "mmwave_comm", "gimbal", "server", "state_report"},
     "S3": {"clock", "sync", "thz_tx", "fpga", "baseband", "mmwave", "perception", "state_report"},
     "S4": {"clock", "sync", "thz_tx", "fpga", "baseband", "mmwave", "perception", "gimbal", "server", "state_report"},
     "S5": {"mmwave", "perception", "mmwave_comm", "gimbal_feedback", "server", "state_report"},
+    "S6": {"clock", "sync", "thz_tx", "fpga", "baseband", "mmwave", "perception", "gimbal", "state_report"},
+    "S7": {"mmwave", "baseband", "gimbal", "state_report"},
 }
+
+STATE_ORDER = ["IDLE", "S0", "S1", "S2", "S3", "S4", "S6", "S5", "S7", "FAULT"]
 
 
 def create_state_machine_graph(current_state: str) -> Any:
@@ -40,7 +46,7 @@ def create_state_machine_graph(current_state: str) -> Any:
     )
     dot.attr("node", fontname="Microsoft YaHei", fontsize="10", margin="0.15,0.1")
 
-    for state in ["S0", "S1", "S2", "S3", "S4", "S5"]:
+    for state in STATE_ORDER:
         if state == current_state:
             dot.node(
                 state,
@@ -70,14 +76,22 @@ def create_state_machine_graph(current_state: str) -> Any:
             )
 
     edges = [
+        ("IDLE", "S0", "启动", "#58A6FF"),
         ("S0", "S1", "自检\n通过", "#58A6FF"),
         ("S1", "S2", "检测到\n稳定目标", "#58A6FF"),
         ("S2", "S3", "云台\n到位", "#58A6FF"),
         ("S3", "S4", "锁定\n成功", "#58A6FF"),
         ("S3", "S5", "捕获\n超时", "#F85149"),
-        ("S4", "S5", "失锁/质量\n变差", "#F85149"),
+        ("S4", "S6", "短时\n失锁", "#F85149"),
+        ("S6", "S4", "重捕获\n成功", "#3FB950"),
+        ("S6", "S5", "重捕获\n超时", "#F85149"),
+        ("S6", "S2", "目标\n移动", "#FFA657"),
         ("S5", "S2", "毫米波\n恢复", "#3FB950"),
         ("S5", "S1", "长时间\n无恢复", "#FFA657"),
+        ("S7", "S2", "恢复且\n有目标", "#3FB950"),
+        ("S7", "S1", "恢复但\n无目标", "#3FB950"),
+        ("S7", "FAULT", "恢复\n失败", "#F85149"),
+        ("FAULT", "IDLE", "人工\n复位", "#58A6FF"),
     ]
     for src, dst, label, color in edges:
         dot.edge(src, dst, label=label, color=color, fontcolor=color, fontsize="8", penwidth="1.5", arrowsize="0.8")
@@ -86,20 +100,28 @@ def create_state_machine_graph(current_state: str) -> Any:
 
 def _create_state_machine_dot_source(current_state: str) -> str:
     node_lines = []
-    for state in ["S0", "S1", "S2", "S3", "S4", "S5"]:
+    for state in STATE_ORDER:
         fill = "#DCFCE7" if state == current_state else "#FFFFFF"
         color = "#16A34A" if state == current_state else "#C8D1DC"
         label = f"{state}\\n{STATE_NAMES[state]}"
         node_lines.append(f'"{state}" [label="{label}", fillcolor="{fill}", color="{color}"];')
     edge_lines = [
+        '"IDLE" -> "S0" [label="启动"];',
         '"S0" -> "S1" [label="自检通过"];',
         '"S1" -> "S2" [label="检测到稳定目标"];',
         '"S2" -> "S3" [label="云台到位"];',
         '"S3" -> "S4" [label="锁定成功"];',
         '"S3" -> "S5" [label="捕获超时"];',
-        '"S4" -> "S5" [label="失锁/质量变差"];',
+        '"S4" -> "S6" [label="短时失锁"];',
+        '"S6" -> "S4" [label="重捕获成功"];',
+        '"S6" -> "S5" [label="重捕获超时"];',
+        '"S6" -> "S2" [label="目标移动"];',
         '"S5" -> "S2" [label="毫米波恢复"];',
         '"S5" -> "S1" [label="长时间无恢复"];',
+        '"S7" -> "S2" [label="恢复且有目标"];',
+        '"S7" -> "S1" [label="恢复但无目标"];',
+        '"S7" -> "FAULT" [label="恢复失败"];',
+        '"FAULT" -> "IDLE" [label="人工复位"];',
     ]
     return (
         "digraph DSP { rankdir=LR; bgcolor=\"transparent\"; "

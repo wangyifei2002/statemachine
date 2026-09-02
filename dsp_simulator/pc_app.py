@@ -1017,7 +1017,7 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                 thz = value.get("thz", {})
                 return (
                     f"目标{flag(mmw.get('target_valid'))} SNR {compact_value(mmw.get('snr_db'))} | "
-                    f"云台到位{flag(gimbal.get('in_position'))} 误差 {compact_value(gimbal.get('position_error_deg'))} | "
+                    f"云台到位{flag(gimbal.get('in_position'))} 误差 {compact_value(gimbal.get('position_error_mdeg'))} | "
                     f"THz锁定{flag(thz.get('lock_flag'))} 质量 {compact_value(thz.get('link_quality'))}"
                 )
             mmw = value.get("mmwave", {})
@@ -1031,12 +1031,12 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
         if module == MODULE_GIMBAL:
             if direction == "input":
                 return (
-                    f"使能{flag(value.get('enable'))} | 目标角 {fmt_pair(value.get('target_azimuth_deg'), value.get('target_elevation_deg'))} | "
+                    f"使能{flag(value.get('enable'))} | 目标角 {fmt_pair(value.get('target_azimuth_mdeg'), value.get('target_elevation_mdeg'))} | "
                     f"微调{flag(value.get('fine_tune_enable'))}"
                 )
             return (
-                f"到位{flag(value.get('in_position'))} | 当前角 {fmt_pair(value.get('current_azimuth_deg'), value.get('current_elevation_deg'))} | "
-                f"误差 {compact_value(value.get('position_error_deg'))}"
+                f"到位{flag(value.get('in_position'))} | 当前角 {fmt_pair(value.get('current_azimuth_mdeg'), value.get('current_elevation_mdeg'))} | "
+                f"误差 {compact_value(value.get('position_error_mdeg'))}"
             )
         if module == MODULE_MMWAVE:
             if direction == "input":
@@ -1135,7 +1135,8 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
         active_payload = uplink_data.get(MODULE_THZ if "太赫" in str(uplink_mode) or str(uplink_mode).lower() == "thz" else MODULE_MMWAVE, {})
         link_quality = active_payload.get("link_quality")
         ready = link_quality is not None and float(link_quality) > 0
-        quality_value = max(0.0, min(1.0, float(link_quality or 0.0)))
+        raw_quality = float(link_quality or 0.0)
+        quality_value = max(0.0, min(1.0, raw_quality / 1000.0))
         quality_percent = int(quality_value * 100)
         return (
             "<div class='panel'>"
@@ -1219,11 +1220,11 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
         if module == MODULE_GIMBAL:
             output = io.get("output", {}) if isinstance(io.get("output"), dict) else {}
             input_payload = io.get("input", {}) if isinstance(io.get("input"), dict) else {}
-            position_error = output.get("position_error_deg")
+            position_error = output.get("position_error_mdeg")
             if output.get("in_position"):
-                return status_dict("到位", f"误差 {compact_value(position_error)}°", "ok")
+                return status_dict("到位", f"误差 {compact_value(position_error)} mdeg", "ok")
             if input_payload.get("enable"):
-                return status_dict("转动中", f"误差 {compact_value(position_error)}°", "info")
+                return status_dict("转动中", f"误差 {compact_value(position_error)} mdeg", "info")
             return status_dict("待命", "未接收转动使能", "idle")
 
         if module == MODULE_MMWAVE:
@@ -1236,7 +1237,7 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                 return status_dict("搜索中", "当前无有效目标", "info" if current_state == "S1" else "warn")
             if snr < 10.0:
                 return status_dict("低信噪比", f"SNR {compact_value(snr)} dB", "warn")
-            if link.get("uplink_ready") and link_quality < 0.3:
+            if link.get("uplink_ready") and link_quality < 300:
                 return status_dict("链路弱", f"质量 {compact_value(link_quality)}", "warn")
             return status_dict("目标稳定", f"SNR {compact_value(snr)} dB", "ok")
 
@@ -1249,9 +1250,9 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                 return status_dict("待命", "当前状态未启用 THz", "idle")
             if not output.get("lock_flag"):
                 return status_dict("未锁定", f"链路质量 {compact_value(link_quality)}", "warn")
-            if link_quality < 0.4:
+            if link_quality < 400:
                 return status_dict("通信弱", f"链路质量 {compact_value(link_quality)}", "warn")
-            if sense_quality < 0.5:
+            if sense_quality < 500:
                 return status_dict("感知弱", f"感知质量 {compact_value(sense_quality)}", "warn")
             return status_dict("锁定", f"链路质量 {compact_value(link_quality)}", "ok")
 
@@ -1520,30 +1521,30 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                     emit(module, SIM_SET_FAULT, {"online": True, "fault_mode": "none", "drop_rate": 0.0}, f"{module}恢复在线")
                 emit(MODULE_MMWAVE, SIM_SET_TARGET, {
                     "target_valid": True,
-                    "azimuth_deg": 12.0,
-                    "elevation_deg": 2.0,
+                    "azimuth_mdeg": 12000,
+                    "elevation_mdeg": 2000,
                     "range_m": 120.0,
                     "radial_speed_mps": 0.0,
                     "snr_db": 18.0,
-                    "noise_level": 0.0,
-                    "comm_link_quality": 0.75,
+                    "noise_level_mdeg": 0,
+                    "comm_link_quality": 750,
                 }, "毫米波目标恢复稳定")
                 emit(MODULE_THZ, SIM_SET_THZ_LINK, {
                     "force_timeout": False,
                     "auto_lock": True,
                     "force_lock": True,
-                    "link_quality": 0.95,
-                    "sense_quality": 0.9,
-                    "sense_noise": 0.0,
+                    "link_quality": 950,
+                    "sense_quality": 900,
+                    "sense_noise_mdeg": 0,
                 }, "THz链路恢复")
 
-            def current_gimbal_target() -> tuple[float, float]:
+            def current_gimbal_target() -> tuple[int, int]:
                 gimbal_input = module_io(MODULE_GIMBAL).get("input", {})
                 if not isinstance(gimbal_input, dict):
-                    return 12.0, 2.0
+                    return 12000, 2000
                 return (
-                    float(gimbal_input.get("target_azimuth_deg", 12.0) or 12.0),
-                    float(gimbal_input.get("target_elevation_deg", 2.0) or 2.0),
+                    int(gimbal_input.get("target_azimuth_mdeg", 12000) or 12000),
+                    int(gimbal_input.get("target_elevation_mdeg", 2000) or 2000),
                 )
 
             with tab_mmwave:
@@ -1551,12 +1552,12 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                 if col_a.button("毫米波目标出现", width="stretch", key="evt_mmw_target_appear"):
                     emit(MODULE_MMWAVE, SIM_SET_TARGET, {
                         "target_valid": True,
-                        "azimuth_deg": 12.0,
-                        "elevation_deg": 2.0,
+                        "azimuth_mdeg": 12000,
+                        "elevation_mdeg": 2000,
                         "range_m": 120.0,
                         "radial_speed_mps": 0.0,
                         "snr_db": 18.0,
-                        "noise_level": 0.0,
+                        "noise_level_mdeg": 0,
                     }, "毫米波目标出现")
                 if col_b.button("毫米波目标消失", width="stretch", key="evt_mmw_target_lost"):
                     emit(MODULE_MMWAVE, SIM_SET_TARGET, {"target_valid": False}, "毫米波目标消失")
@@ -1565,30 +1566,30 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                     emit(MODULE_MMWAVE, SIM_SET_TARGET, {
                         "target_valid": True,
                         "snr_db": 18.0,
-                        "noise_level": 0.0,
+                        "noise_level_mdeg": 0,
                     }, "毫米波感知恢复")
                 if col_d.button("毫米波感知质量下降", width="stretch", key="evt_mmw_sense_degrade"):
                     emit(MODULE_MMWAVE, SIM_SET_TARGET, {
                         "target_valid": True,
                         "snr_db": 5.0,
-                        "noise_level": 1.5,
+                        "noise_level_mdeg": 1500,
                     }, "毫米波感知质量下降")
                 col_e, col_f = st.columns(2)
                 if col_e.button("毫米波目标角度恢复", width="stretch", key="evt_mmw_angle_restore"):
                     emit(MODULE_MMWAVE, SIM_SET_TARGET, {
                         "target_valid": True,
-                        "azimuth_deg": 12.0,
-                        "elevation_deg": 2.0,
+                        "azimuth_mdeg": 12000,
+                        "elevation_mdeg": 2000,
                         "snr_db": 18.0,
-                        "noise_level": 0.0,
+                        "noise_level_mdeg": 0,
                     }, "毫米波目标角度恢复")
                 if col_f.button("毫米波目标角度跳变", width="stretch", key="evt_mmw_angle_jump"):
                     emit(MODULE_MMWAVE, SIM_SET_TARGET, {
                         "target_valid": True,
-                        "azimuth_deg": 28.0,
-                        "elevation_deg": -4.0,
+                        "azimuth_mdeg": 28000,
+                        "elevation_mdeg": -4000,
                         "snr_db": 18.0,
-                        "noise_level": 0.0,
+                        "noise_level_mdeg": 0,
                     }, "毫米波目标角度跳变")
             with tab_gimbal:
                 col_a, col_b = st.columns(2)
@@ -1600,15 +1601,15 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                 if col_c.button("云台对准恢复", width="stretch", key="evt_gimbal_align_restore"):
                     target_azimuth, target_elevation = current_gimbal_target()
                     emit(MODULE_GIMBAL, SIM_SET_GIMBAL, {
-                        "current_azimuth_deg": target_azimuth,
-                        "current_elevation_deg": target_elevation,
-                        "speed_limit_deg_s": 20.0,
+                        "current_azimuth_mdeg": target_azimuth,
+                        "current_elevation_mdeg": target_elevation,
+                        "speed_limit_mdeg_s": 20000,
                     }, "云台对准恢复")
                 if col_d.button("云台偏离目标", width="stretch", key="evt_gimbal_deviation"):
                     emit(MODULE_GIMBAL, SIM_SET_GIMBAL, {
-                        "current_azimuth_deg": -25.0,
-                        "current_elevation_deg": 8.0,
-                        "speed_limit_deg_s": 3.0,
+                        "current_azimuth_mdeg": -25000,
+                        "current_elevation_mdeg": 8000,
+                        "speed_limit_mdeg_s": 3000,
                     }, "云台偏离目标")
 
             with tab_thz_sense:
@@ -1618,16 +1619,16 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                         "force_timeout": False,
                         "auto_lock": True,
                         "force_lock": True,
-                        "link_quality": 0.95,
-                        "sense_quality": 0.9,
-                        "sense_noise": 0.0,
+                        "link_quality": 950,
+                        "sense_quality": 900,
+                        "sense_noise_mdeg": 0,
                     }, "THz捕获成功")
                 if col_b.button("THz捕获超时", width="stretch", key="evt_thz_capture_timeout"):
                     emit(MODULE_THZ, SIM_SET_THZ_LINK, {
                         "force_timeout": True,
                         "auto_lock": False,
                         "force_lock": False,
-                        "link_quality": 0.95,
+                        "link_quality": 950,
                     }, "THz捕获超时")
                 col_c, col_d = st.columns(2)
                 if col_c.button("THz感知质量恢复", width="stretch", key="evt_thz_sense_restore"):
@@ -1635,13 +1636,13 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                         "force_timeout": False,
                         "auto_lock": True,
                         "force_lock": True,
-                        "sense_quality": 0.9,
-                        "sense_noise": 0.0,
+                        "sense_quality": 900,
+                        "sense_noise_mdeg": 0,
                     }, "THz感知质量恢复")
                 if col_d.button("THz感知质量下降", width="stretch", key="evt_thz_sense_degrade"):
                     emit(MODULE_THZ, SIM_SET_THZ_LINK, {
-                        "sense_quality": 0.25,
-                        "sense_noise": 1.2,
+                        "sense_quality": 250,
+                        "sense_noise_mdeg": 1200,
                     }, "THz感知质量下降")
 
             with tab_comm:
@@ -1651,14 +1652,14 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                         "force_timeout": False,
                         "auto_lock": True,
                         "force_lock": True,
-                        "link_quality": 0.95,
+                        "link_quality": 950,
                     }, "THz通信链路恢复")
                 if col_b.button("THz通信链路质量低", width="stretch", key="evt_thz_comm_degrade"):
                     emit(MODULE_THZ, SIM_SET_THZ_LINK, {
                         "force_timeout": False,
                         "auto_lock": True,
                         "force_lock": True,
-                        "link_quality": 0.2,
+                        "link_quality": 200,
                     }, "THz通信链路质量低")
                 col_c, col_d = st.columns(2)
                 if col_c.button("THz锁定恢复", width="stretch", key="evt_thz_lock_restore"):
@@ -1666,20 +1667,20 @@ def run_streamlit_app(args: argparse.Namespace) -> None:
                         "force_timeout": False,
                         "auto_lock": True,
                         "force_lock": True,
-                        "link_quality": 0.95,
+                        "link_quality": 950,
                     }, "THz锁定恢复")
                 if col_d.button("THz失锁", width="stretch", key="evt_thz_unlock"):
                     emit(MODULE_THZ, SIM_SET_THZ_LINK, {
                         "force_timeout": True,
                         "auto_lock": False,
                         "force_lock": False,
-                        "link_quality": 0.2,
+                        "link_quality": 200,
                     }, "THz失锁")
                 col_e, col_f = st.columns(2)
                 if col_e.button("毫米波备用通信恢复", width="stretch", key="evt_mmw_comm_restore"):
-                    emit(MODULE_MMWAVE, SIM_SET_TARGET, {"comm_link_quality": 0.75}, "毫米波备用通信恢复")
+                    emit(MODULE_MMWAVE, SIM_SET_TARGET, {"comm_link_quality": 750}, "毫米波备用通信恢复")
                 if col_f.button("毫米波备用通信质量低", width="stretch", key="evt_mmw_comm_degrade"):
-                    emit(MODULE_MMWAVE, SIM_SET_TARGET, {"comm_link_quality": 0.15}, "毫米波备用通信质量低")
+                    emit(MODULE_MMWAVE, SIM_SET_TARGET, {"comm_link_quality": 150}, "毫米波备用通信质量低")
 
             with tab_transport:
                 if st.button("全系统恢复默认", width="stretch", key="evt_restore_all"):

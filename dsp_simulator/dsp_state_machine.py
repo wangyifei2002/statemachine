@@ -48,8 +48,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def latest_payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    return messages[-1].get("payload", {}) if messages else {}
+def latest_payload(messages: list[dict[str, Any]], current_slot: int) -> dict[str, Any]:
+    if not messages:
+        return {}
+    message = messages[-1]
+    payload = dict(message.get("payload", {}))
+    payload["age_slots"] = max(0, current_slot - int(message.get("slot_id", current_slot)))
+    return payload
 
 
 def compact_payload(payload: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -76,25 +81,25 @@ def build_slot_io(snapshot: dict[str, Any], outputs: list[dict[str, Any]]) -> di
     return {
         MODULE_DSP: {
             "input": {
-                "mmwave": compact_payload(mmwave_detect, ("target_valid", "azimuth_deg", "range_m", "snr_db")),
-                "gimbal": compact_payload(gimbal_fb, ("in_position", "position_error_deg", "fault_mode")),
+                "mmwave": compact_payload(mmwave_detect, ("target_valid", "azimuth_mdeg", "range_m", "snr_db")),
+                "gimbal": compact_payload(gimbal_fb, ("in_position", "position_error_mdeg", "fault_mode")),
                 "thz": compact_payload(thz_status, ("lock_flag", "link_quality", "loss_count")),
             },
             "output": {
                 "mmwave": compact_payload(mmwave_cmd, ("rf_enable", "sense_enable", "comm_enable", "scan_mode")),
-                "gimbal": compact_payload(gimbal_cmd, ("enable", "target_azimuth_deg", "target_elevation_deg", "fine_tune_enable")),
+                "gimbal": compact_payload(gimbal_cmd, ("enable", "target_azimuth_mdeg", "target_elevation_mdeg", "fine_tune_enable")),
                 "thz": compact_payload(thz_param, ("thz_enable", "sense_enable", "comm_enable", "traffic_enable")),
                 "pc": compact_payload(uplink_state, ("state_id", "transition", "uplink_mode")),
             },
         },
         MODULE_GIMBAL: {
-            "input": compact_payload(gimbal_cmd, ("enable", "target_azimuth_deg", "target_elevation_deg", "angular_speed", "fine_tune_enable")),
-            "output": compact_payload(gimbal_fb, ("in_position", "current_azimuth_deg", "current_elevation_deg", "position_error_deg", "fault_mode")),
+            "input": compact_payload(gimbal_cmd, ("enable", "target_azimuth_mdeg", "target_elevation_mdeg", "angular_speed_mdeg_s", "fine_tune_enable")),
+            "output": compact_payload(gimbal_fb, ("in_position", "current_azimuth_mdeg", "current_elevation_mdeg", "position_error_mdeg", "fault_mode")),
         },
         MODULE_MMWAVE: {
             "input": compact_payload(mmwave_cmd, ("rf_enable", "sense_enable", "comm_enable", "scan_mode", "comm_rate_level")),
             "output": {
-                "detect": compact_payload(mmwave_detect, ("target_valid", "azimuth_deg", "elevation_deg", "range_m", "snr_db")),
+                "detect": compact_payload(mmwave_detect, ("target_valid", "azimuth_mdeg", "elevation_mdeg", "range_m", "snr_db")),
                 "link": compact_payload(mmwave_link, ("uplink_ready", "link_quality", "sense_quality")),
             },
         },
@@ -205,12 +210,13 @@ def run_sim(args: argparse.Namespace) -> None:
             refresh_health_timeouts(slot_id, health, health_detail, last_health_slot)
 
             snapshot = {
+                "start": slot_id == 1,
                 "health": dict(health),
                 "health_detail": {module: dict(detail) for module, detail in health_detail.items()},
-                "PKT_MMW_DETECT": latest_payload(latest_by_packet.get("PKT_MMW_DETECT", [])),
-                "PKT_MMW_LINK_STATUS": latest_payload(latest_by_packet.get("PKT_MMW_LINK_STATUS", [])),
-                "PKT_GIMBAL_FB": latest_payload(latest_by_packet.get("PKT_GIMBAL_FB", [])),
-                "PKT_THZ_STATUS": latest_payload(latest_by_packet.get("PKT_THZ_STATUS", [])),
+                "PKT_MMW_DETECT": latest_payload(latest_by_packet.get("PKT_MMW_DETECT", []), slot_id),
+                "PKT_MMW_LINK_STATUS": latest_payload(latest_by_packet.get("PKT_MMW_LINK_STATUS", []), slot_id),
+                "PKT_GIMBAL_FB": latest_payload(latest_by_packet.get("PKT_GIMBAL_FB", []), slot_id),
+                "PKT_THZ_STATUS": latest_payload(latest_by_packet.get("PKT_THZ_STATUS", []), slot_id),
             }
             result = machine.step(slot_id, snapshot)
             recorder.record("state", {

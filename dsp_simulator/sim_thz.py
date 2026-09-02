@@ -31,17 +31,18 @@ class ThzState:
     lock_flag: bool = False
     force_lock: bool = False
     auto_lock: bool = True
-    link_quality: float = 0.95
-    sense_quality: float = 0.9
+    link_quality: int = 950
+    sense_quality: int = 900
     velocity_mps: float = 0.0
     position_m: float = 0.0
-    angle_deg: float = 0.0
-    sense_noise: float = 0.0
+    angle_mdeg: int = 0
+    sense_noise_mdeg: int = 0
     capture_delay_slots: int = 5
     enabled_slots: int = 0
     force_timeout: bool = False
     loss_count: int = 0
     frame_seq: int = 0
+    sample_seq: int = 0
     drop_rate: float = 0.0
     fault_mode: str = "none"
     rate_level: int = 0
@@ -83,19 +84,23 @@ class ThzState:
             self.loss_count = 0
 
     def status_payload(self) -> dict:
+        self.sample_seq += 1
         sense_active = self.online and self.thz_enable and self.sense_enable and self.fault_mode != "offline"
-        noise = self.sense_noise if sense_active else 0.0
+        noise = self.sense_noise_mdeg if sense_active else 0
         return {
+            "valid": self.online and self.fault_mode != "offline",
+            "seq": self.sample_seq,
+            "age_slots": 0,
             "lock_flag": bool(self.lock_flag),
             "force_lock": self.force_lock,
             "auto_lock": self.auto_lock,
             "sense_enable": self.sense_enable,
             "comm_enable": self.comm_enable,
-            "link_quality": round(float(self.link_quality), 3),
-            "sense_quality": round(float(self.sense_quality if sense_active else 0.0), 3),
-            "velocity": round(self.velocity_mps + random.uniform(-noise, noise), 3),
-            "position": round(self.position_m + random.uniform(-noise, noise), 3),
-            "angle": round(self.angle_deg + random.uniform(-noise, noise), 3),
+            "link_quality": self.link_quality,
+            "sense_quality": self.sense_quality if sense_active else 0,
+            "velocity": round(self.velocity_mps, 3),
+            "position": round(self.position_m, 3),
+            "angle_mdeg": int(round(self.angle_mdeg + random.uniform(-noise, noise))),
             "loss_count": self.loss_count,
             "rate_level": self.rate_level,
             "modulation_order": self.modulation_order,
@@ -110,7 +115,7 @@ class ThzState:
             "crc": "ok",
             "rate_level": self.rate_level,
             "modulation_order": self.modulation_order,
-            "link_quality": round(float(self.link_quality), 3),
+            "link_quality": self.link_quality,
             "uplink_mode": "thz",
         }
 

@@ -30,16 +30,17 @@ class MmwaveState:
     comm_enable: bool = False
     scan_mode: str = "idle"
     target_valid: bool = False
-    azimuth_deg: float = 12.0
-    elevation_deg: float = 2.0
+    azimuth_mdeg: int = 12000
+    elevation_mdeg: int = 2000
     range_m: float = 120.0
     radial_speed_mps: float = 0.0
     snr_db: float = 18.0
-    noise_level: float = 0.0
-    comm_link_quality: float = 0.75
+    noise_level_mdeg: int = 0
+    comm_link_quality: int = 750
     comm_rate_level: int = 1
     comm_modulation_order: int = 2
     frame_seq: int = 0
+    sample_seq: int = 0
     drop_rate: float = 0.0
     fault_mode: str = "none"
 
@@ -52,16 +53,20 @@ class MmwaveState:
         self.comm_modulation_order = int(payload.get("comm_modulation_order", self.comm_modulation_order))
 
     def detect_payload(self) -> dict:
+        self.sample_seq += 1
         active = self.sense_active()
         valid = bool(active and self.target_valid)
-        noise = self.noise_level
+        noise = self.noise_level_mdeg
         return {
+            "valid": active,
+            "seq": self.sample_seq,
+            "age_slots": 0,
             "target_valid": valid,
-            "azimuth_deg": round(self.azimuth_deg + random.uniform(-noise, noise), 3),
-            "elevation_deg": round(self.elevation_deg + random.uniform(-noise, noise), 3),
-            "range_m": round(self.range_m + random.uniform(-noise, noise), 3),
-            "radial_speed_mps": round(self.radial_speed_mps + random.uniform(-noise, noise), 3),
-            "snr_db": round(self.snr_db - abs(random.uniform(0, noise)), 3),
+            "azimuth_mdeg": int(round(self.azimuth_mdeg + random.uniform(-noise, noise))),
+            "elevation_mdeg": int(round(self.elevation_mdeg + random.uniform(-noise, noise))),
+            "range_m": round(self.range_m, 3),
+            "radial_speed_mps": round(self.radial_speed_mps, 3),
+            "snr_db": round(self.snr_db, 3),
             "scan_mode": self.scan_mode,
             "sense_enable": self.sense_enable,
         }
@@ -74,11 +79,14 @@ class MmwaveState:
 
     def link_status_payload(self) -> dict:
         return {
+            "valid": self.online,
+            "seq": self.sample_seq,
+            "age_slots": 0,
             "comm_enable": self.comm_enable,
-            "link_quality": round(float(self.comm_link_quality if self.comm_active() else 0.0), 3),
+            "link_quality": self.comm_link_quality if self.comm_active() else 0,
             "rate_level": self.comm_rate_level if self.comm_active() else 0,
             "modulation_order": self.comm_modulation_order if self.comm_active() else 0,
-            "uplink_ready": self.comm_active() and self.comm_link_quality >= 0.3,
+            "uplink_ready": self.comm_active() and self.comm_link_quality >= 300,
         }
 
     def bitstream_payload(self) -> dict:
@@ -86,10 +94,10 @@ class MmwaveState:
         return {
             "payload_bits": 1024,
             "frame_seq": self.frame_seq,
-            "crc": "ok" if self.comm_link_quality >= 0.3 else "weak",
+            "crc": "ok" if self.comm_link_quality >= 300 else "weak",
             "rate_level": self.comm_rate_level,
             "modulation_order": self.comm_modulation_order,
-            "link_quality": round(float(self.comm_link_quality), 3),
+            "link_quality": self.comm_link_quality,
             "uplink_mode": "mmwave",
         }
 

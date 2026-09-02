@@ -1,26 +1,36 @@
 """Shared state, packet, and visualization definitions."""
 
 STATE_NAMES = {
+    "IDLE": "待机", "FAULT": "故障安全",
     "S0": "自检", "S1": "搜索", "S2": "粗对准",
     "S3": "捕获", "S4": "跟踪", "S5": "回退",
+    "S6": "快速重捕获", "S7": "模块恢复",
 }
 
 STATE_NAMES_CN = {
+    "IDLE": "待机 (Idle)", "FAULT": "故障安全 (Fault)",
     "S0": "自检 (Self-Test)", "S1": "搜索 (Search)",
     "S2": "粗对准 (Coarse)", "S3": "捕获 (Acquisition)",
     "S4": "跟踪 (Tracking)", "S5": "回退 (Fallback)",
+    "S6": "快速重捕获 (Reacquire)", "S7": "模块恢复 (Recovery)",
 }
 
 STATE_DESCRIPTIONS = {
+    "IDLE": "等待显式启动命令，不启用任何业务链路",
+    "FAULT": "自动恢复失败后的安全状态，仅接受人工复位",
     "S0": "系统初始状态，检查毫米波、太赫兹、云台和 DSP 接口连通性",
     "S1": "等待毫米波感知发现目标，连续若干个 slot 检测到有效目标后进入下一状态",
     "S2": "DSP 根据毫米波目标角度控制云台转向，等待云台误差收敛到阈值内",
     "S3": "在云台粗对准前提下，等待太赫兹上行链路锁定，超时则进入回退",
     "S4": "太赫兹链路正常工作，监控链路质量并按需微调云台",
     "S5": "上行切回毫米波模式，依靠毫米波感知维持目标信息并尝试恢复",
+    "S6": "THz短时失锁后保留目标和云台位置，执行快速重捕获",
+    "S7": "关键模块异常后停止业务动作，周期查询并尝试恢复模块",
 }
 
 STATE_TRANSITIONS = {
+    "IDLE": [("S0", "启动", "收到启动命令后进入模块自检")],
+    "FAULT": [("IDLE", "人工复位", "清除故障并回到待机状态")],
     "S0": [("S1", "自检通过", "各模块连通性检查正常，准备进入搜索阶段")],
     "S1": [("S2", "检测到稳定目标", "毫米波连续检测到有效目标，准备进入粗对准")],
     "S2": [("S3", "云台到位（误差<阈值）", "云台转向完成，误差已收敛，准备进入捕获")],
@@ -28,16 +38,27 @@ STATE_TRANSITIONS = {
         ("S4", "太赫兹锁定成功", "太赫兹上行链路锁定成功，准备进入跟踪阶段"),
         ("S5", "捕获超时", "太赫兹锁定超时，切换到毫米波回退模式"),
     ],
-    "S4": [("S5", "链路质量变差/失锁", "太赫兹链路质量连续变差或失锁，进入回退状态")],
+    "S4": [("S6", "链路质量变差/失锁", "太赫兹短时失锁，优先快速重捕获")],
     "S5": [
         ("S2", "毫米波稳定恢复", "毫米波感知恢复稳定，重新进入粗对准阶段"),
         ("S1", "长时间无恢复", "毫米波长时间无法恢复，回到搜索阶段重新搜索目标"),
     ],
+    "S6": [
+        ("S4", "重捕获成功", "太赫兹重新锁定并返回跟踪"),
+        ("S5", "重捕获超时", "快速重捕获失败，进入毫米波回退"),
+        ("S2", "目标移动", "目标变化超出阈值，重新执行粗对准"),
+    ],
+    "S7": [
+        ("S2", "恢复且目标有效", "模块恢复后重新粗对准"),
+        ("S1", "恢复但无目标", "模块恢复后重新搜索"),
+        ("FAULT", "恢复失败", "超过恢复次数或超时，进入安全故障态"),
+    ],
 }
 
 UPLINK_MODE = {
-    "S0": "毫米波", "S1": "毫米波", "S2": "毫米波",
-    "S3": "太赫兹", "S4": "太赫兹", "S5": "毫米波",
+    "IDLE": "关闭", "FAULT": "关闭", "S0": "关闭",
+    "S1": "毫米波", "S2": "毫米波", "S3": "太赫兹捕获",
+    "S4": "太赫兹", "S5": "毫米波", "S6": "太赫兹重捕获", "S7": "关闭",
 }
 
 SLOT_PACKET_SPECS = [
@@ -45,7 +66,7 @@ SLOT_PACKET_SPECS = [
         "id": "PKT_SYS_HEALTH",
         "name": "系统自检状态包",
         "phase": "T0",
-        "states": ["S0"],
+        "states": ["S0", "S7", "FAULT"],
         "direction": "DSP内部/各模块 -> DSP",
         "interface": "本地轮询 + 接口在线检测",
         "cadence": "每 slot 1 次",
@@ -56,7 +77,7 @@ SLOT_PACKET_SPECS = [
         "id": "SIG_CLOCK_SYNC",
         "name": "时钟同步信号",
         "phase": "T0",
-        "states": ["S0", "S3", "S4"],
+        "states": ["S0", "S3", "S4", "S6"],
         "direction": "铷钟/恒温晶振 -> 发射机射频模块/FPGA基带板",
         "interface": "SMA/BNC",
         "cadence": "连续信号，按 slot 检查锁定状态",
@@ -67,18 +88,18 @@ SLOT_PACKET_SPECS = [
         "id": "PKT_MMW_DETECT",
         "name": "毫米波目标感知包",
         "phase": "T1",
-        "states": ["S1", "S2", "S3", "S4", "S5"],
+        "states": ["S1", "S2", "S3", "S4", "S5", "S6", "S7"],
         "direction": "毫米波通感基带模块 -> DSP",
         "interface": "数字通信接口",
         "cadence": "每 slot 1 次",
-        "fields": ["target_valid", "azimuth_deg", "elevation_deg", "range_m", "radial_speed_mps", "snr_db"],
+        "fields": ["target_valid", "azimuth_mdeg", "elevation_mdeg", "range_m", "radial_speed_mps", "snr_db"],
         "purpose": "搜索目标、粗对准角度输入、捕获辅助、跟踪辅助和回退恢复判决",
     },
     {
         "id": "PKT_MMW_RF_CTRL",
         "name": "毫米波射频启停控制包",
         "phase": "T1",
-        "states": ["S1", "S2", "S3", "S4", "S5"],
+        "states": ["S1", "S2", "S3", "S4", "S5", "S6"],
         "direction": "DSP -> 毫米波通感基带模块/射频模块",
         "interface": "射频/中频链路控制",
         "cadence": "状态变化时下发，每 slot 可刷新",
@@ -100,29 +121,29 @@ SLOT_PACKET_SPECS = [
         "id": "PKT_GIMBAL_CMD",
         "name": "云台控制命令包",
         "phase": "T2",
-        "states": ["S2", "S4"],
+        "states": ["S2", "S4", "S6"],
         "direction": "DSP -> 云台",
         "interface": "RS485",
         "cadence": "每 slot 1 次或角度变化时下发",
-        "fields": ["cmd_seq", "target_azimuth_deg", "target_elevation_deg", "angular_speed", "fine_tune_enable"],
+        "fields": ["cmd_seq", "target_azimuth_mdeg", "target_elevation_mdeg", "angular_speed_mdeg_s", "fine_tune_enable"],
         "purpose": "粗对准阶段转向目标，跟踪阶段执行小幅微调",
     },
     {
         "id": "PKT_GIMBAL_FB",
         "name": "云台反馈状态包",
         "phase": "T3",
-        "states": ["S2", "S4", "S5"],
+        "states": ["S2", "S4", "S5", "S6"],
         "direction": "云台 -> DSP",
         "interface": "RS485/反馈链路",
         "cadence": "每 slot 1 次",
-        "fields": ["current_azimuth_deg", "current_elevation_deg", "angular_speed", "in_position", "position_error_deg"],
+        "fields": ["current_azimuth_mdeg", "current_elevation_mdeg", "angular_speed_mdeg_s", "in_position", "position_error_mdeg"],
         "purpose": "判断云台是否转移到位，并给跟踪微调提供闭环反馈",
     },
     {
         "id": "PKT_THZ_PARAM",
         "name": "太赫兹/基带通信参数包",
         "phase": "T2",
-        "states": ["S3", "S4"],
+        "states": ["S3", "S4", "S6"],
         "direction": "DSP -> FPGA基带板/毫米波通感基带模块",
         "interface": "数字通信接口",
         "cadence": "捕获开始下发，跟踪中按需刷新",
@@ -133,7 +154,7 @@ SLOT_PACKET_SPECS = [
         "id": "PKT_THZ_STATUS",
         "name": "太赫兹锁定/链路质量包",
         "phase": "T3",
-        "states": ["S3", "S4"],
+        "states": ["S3", "S4", "S6"],
         "direction": "太赫兹接收/基带模块 -> DSP",
         "interface": "数字通信接口",
         "cadence": "每 slot 1 次",
@@ -166,7 +187,7 @@ SLOT_PACKET_SPECS = [
         "id": "PKT_UPLINK_STATE",
         "name": "状态机上报包",
         "phase": "T5",
-        "states": ["S0", "S1", "S2", "S3", "S4", "S5"],
+        "states": ["IDLE", "S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "FAULT"],
         "direction": "DSP -> 服务器/显示器/PC主机",
         "interface": "上层通信链路",
         "cadence": "每 slot 1 次",
