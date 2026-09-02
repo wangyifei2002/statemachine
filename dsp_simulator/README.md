@@ -4,12 +4,12 @@
 
 当前代码包含两部分：
 
-- `v0` 可视化演示器：基于 Streamlit 展示 `S0-S5` 状态流转、物理架构与数据流向图、当前 slot 数据包清单和链路高亮。
+- `v0` 旧版演示器：基于 Streamlit 展示原 `S0-S5` 流程，仅用于保留早期演示能力。
 - `v1` 本机五进程仿真框架：DSP 状态机作为独立程序运行，云台、毫米波基带、THz 基带和 PC 上位机分别由独立程序提供模拟硬件行为和上位机能力。
 
 ## 当前能力
 
-- 状态机拓扑可视化：展示 `S0` 到 `S5` 的正常、异常和恢复路径。
+- `pc_app.py` 状态机拓扑：展示 `IDLE/FAULT/S0-S7` 的正常、异常和恢复路径。
 - 物理架构与数据流向图：按当前状态高亮参与工作的模块和链路。
 - slot 数据包清单：展示当前状态下每个 slot 涉及的数据包、字段、方向、接口和用途。
 - 数据包链路联动：选择右侧数据包后，在左侧物理架构图中高亮对应链路。
@@ -75,32 +75,37 @@ dsp_simulator/
 |---|---|---|
 | 心跳状态 | DSP 是否在 `health_timeout_slots` 内收到 `PKT_SYS_HEALTH` | 判断连接是否超时，超时后标记 `fault_code=heartbeat_timeout` |
 | 模块在线状态 | `PKT_SYS_HEALTH.online` | 判断模块是否可作为状态机关键依赖 |
-| 功能状态 | `fault_code`、业务包字段，如 `target_valid`、`in_position`、`lock_flag`、`link_quality` | 参与 S1-S5 业务状态转移和诊断 |
+| 功能状态 | `fault_code`、业务包字段，如 `target_valid`、`in_position`、`lock_flag`、`link_quality` | 参与 S1-S7 业务状态转移和诊断 |
 
-关键模块为云台、毫米波基带、THz 基带。PC 是监控端，不作为 DSP 状态机自检通过的必要条件。若任一关键模块连续 `critical_offline_tolerance_slots` 个 slot 离线或心跳超时，状态机从非 S0 状态回到 `S0 自检`，避免在模块缺失时继续搜索、捕获或回退。
+关键模块为云台、毫米波基带、THz 基带。PC 是监控端，不作为 DSP 状态机自检通过的必要条件。运行中任一关键模块故障时，状态机优先进入 `S7 模块恢复`；恢复失败进入 `FAULT`，只能由人工复位返回 `IDLE`。
 
 ## 状态转移矩阵
 
 DSP 状态机应只根据业务协议包和健康状态转移，不读取模拟器内部变量。下表是乘法表式状态转移矩阵：行表示当前状态，列表示目标状态，单元格填写转移条件。`-` 表示无直接转移，对角线表示保持当前状态的条件。
 
-| 当前 \ 目标 | `S0 自检` | `S1 搜索` | `S2 粗对准` | `S3 捕获` | `S4 跟踪` | `S5 回退` |
-|---|---|---|---|---|---|---|
-| `S0 自检` | 任一关键模块未在线，或时钟/同步链路未满足自检条件 | `PKT_SYS_HEALTH` 显示云台、毫米波基带、THz 基带均在线，必要时钟/同步链路正常 | - | - | - | - |
-| `S1 搜索` | - | 未检测到稳定目标，继续搜索 | 连续 `N` 个 slot 检测到稳定毫米波目标：`target_valid=true`、`snr_db >= mmwave_snr_threshold` | - | - | - |
-| `S2 粗对准` | - | 毫米波目标连续丢失超过 `coarse_target_lost_tolerance_slots`，重新搜索 | 云台尚未到位、位置误差仍大、目标仍需继续粗对准，或粗对准时间不足 `coarse_min_slots` | `PKT_MMW_DETECT.target_valid=true`，`PKT_GIMBAL_FB.in_position=true`，且 `position_error_deg <= position_error_threshold_deg` | - | - |
-| `S3 捕获` | - | - | - | THz 尚未锁定但未超时，且毫米波目标、云台到位、THz 链路质量均未超过异常容忍窗口 | `capture_slots >= capture_min_slots`，毫米波目标仍有效，云台仍到位且误差满足阈值，`PKT_THZ_STATUS.lock_flag=true`，`link_quality >= thz_quality_threshold` | THz 模块离线；毫米波目标连续丢失；云台连续偏离；THz 链路质量连续低于阈值；或捕获超时仍未锁定 |
-| `S4 跟踪` | - | - | - | - | THz 在线并保持锁定，`link_quality >= thz_quality_threshold`，毫米波辅助目标和云台微调均未超过异常容忍窗口 | THz 模块离线；连续 `thz_loss_window_slots` 个 slot 失锁；连续 `thz_loss_window_slots` 个 slot 链路质量低；毫米波辅助目标连续丢失；云台连续跟踪偏离 |
-| `S5 回退` | - | 超过 `fallback_timeout_slots` 仍未满足恢复就绪条件，重新进入搜索 | 连续 `fallback_restore_slots` 个 slot 满足恢复就绪：毫米波在线、`target_valid=true`、`snr_db >= mmwave_snr_threshold`、云台在线、THz 在线 | - | - | 回退窗口内继续使用毫米波上行，记录毫米波目标质量、毫米波通信链路、云台在线和 THz 在线状态 |
+| 状态 | 编码 | 主要出口 |
+|---|---:|---|
+| `IDLE` | 0 | 启动请求 -> `S0` |
+| `FAULT` | 1 | 人工复位 -> `IDLE` |
+| `S0 自检` | 2 | 关键模块稳定在线 -> `S1`；超时 -> `FAULT` |
+| `S1 搜索` | 3 | 毫米波目标连续有效 -> `S2` |
+| `S2 粗对准` | 4 | 云台连续到位 -> `S3`；目标丢失/超时 -> `S1` |
+| `S3 捕获` | 5 | THz 连续锁定 -> `S4`；超时 -> `S5` |
+| `S4 跟踪` | 6 | 连续失锁或质量差 -> `S6` |
+| `S5 回退` | 7 | 毫米波恢复 -> `S2`；超时 -> `S1` |
+| `S6 快速重捕获` | 8 | 重捕获成功 -> `S4`；目标移动 -> `S2`；超时 -> `S5` |
+| `S7 模块恢复` | 9 | 模块恢复 -> `S1/S2`；恢复失败 -> `FAULT` |
+
+事件优先级固定为：模块故障、目标丢失、到位或锁定、超时。默认 slot 为 `100 ms`，角度使用 `int32 mdeg`，质量使用 `0..1000` 整数，输入统一携带 `valid/seq/age_slots`。
 
 第一版建议阈值：
 
 | 参数 | 建议值 | 含义 |
 |---|---:|---|
 | `N` | `3 slots` | 连续稳定目标窗口 |
-| `mmwave_snr_threshold` | `10 dB` | 毫米波目标最低可信质量 |
 | `coarse_min_slots` | `2 slots` | 进入 `S2` 后至少等待的粗对准反馈窗口 |
 | `coarse_target_lost_tolerance_slots` | `2 slots` | `S2` 中允许毫米波目标短暂丢失的 slot 数 |
-| `position_error_threshold_deg` | `0.5 deg` | 云台进入捕获前的最大角度误差 |
+| `position_error_threshold_mdeg` | `500 mdeg` | 云台进入捕获前的最大角度误差 |
 | `capture_min_slots` | `2 slots` | 进入 `S3` 后至少等待的 THz 捕获反馈窗口 |
 | `capture_target_lost_tolerance_slots` | `2 slots` | `S3` 中允许毫米波目标短暂抖动/丢失的 slot 数 |
 | `capture_gimbal_error_tolerance_slots` | `2 slots` | `S3` 中允许云台短暂偏离或反馈异常的 slot 数 |
@@ -109,12 +114,20 @@ DSP 状态机应只根据业务协议包和健康状态转移，不读取模拟�
 | `thz_loss_window_slots` | `3 slots` | `S4` 中 THz 失锁或链路质量低的连续判定窗口 |
 | `tracking_target_lost_tolerance_slots` | `3 slots` | `S4` 中允许毫米波辅助目标短暂丢失的 slot 数 |
 | `tracking_gimbal_error_tolerance_slots` | `3 slots` | `S4` 中允许云台微调短暂偏离或反馈异常的 slot 数 |
-| `thz_quality_threshold` | `0.4` | THz 链路质量回退阈值 |
-| `mmwave_link_quality_threshold` | `0.3` | S5 回退时毫米波通信链路可用性的诊断阈值 |
+| `thz_quality_threshold` | `400` | THz 链路质量阈值，量程 `0..1000` |
+| `mmwave_quality_threshold` | `300` | S5 回退时毫米波通信链路阈值，量程 `0..1000` |
 | `fallback_restore_slots` | `3 slots` | S5 中恢复到 S2 前需要连续满足恢复就绪的 slot 数 |
 | `fallback_timeout_slots` | `30 slots` | S5 中等待恢复的最大 slot 数 |
 | `health_timeout_slots` | `3 slots` | 超过该窗口未收到模块健康包则判为心跳超时 |
-| `critical_offline_tolerance_slots` | `3 slots` | 非 S0 状态下关键模块连续离线后回到 S0 的窗口 |
+| `reacquire_timeout_slots` | `20 slots` | S6 快速重捕获窗口 |
+| `recovery_timeout_slots` | `100 slots` | S7 模块恢复最大窗口 |
+
+统一契约、纯 C11 核心和跨语言测试位于 `state_machine/`。可执行：
+
+```bash
+python3 state_machine/tests/compare_implementations.py
+python3 state_machine/tests/run_five_process_smoke.py
+```
 
 ## 仿真模式与真实部署
 

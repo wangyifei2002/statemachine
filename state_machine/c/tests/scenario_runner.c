@@ -83,9 +83,23 @@ static int run_file(const char *path)
             return 1;
         }
         printf("{\"slot_id\":%u,\"previous_state\":\"%s\",\"state\":\"%s\","
-               "\"reason\":\"%s\",\"fault_mask\":%u}\n",
+               "\"reason\":\"%s\",\"fault_mask\":%u,\"recovery_action_mask\":%u,"
+               "\"mmwave\":{\"rf_enable\":%u,\"sense_enable\":%u,\"comm_enable\":%u,"
+               "\"scan_mode\":\"%s\"},"
+               "\"gimbal\":{\"enable\":%u,\"fine_tune_enable\":%u,"
+               "\"target_azimuth_mdeg\":%d,\"target_elevation_mdeg\":%d,"
+               "\"angular_speed_mdeg_s\":%d},"
+               "\"thz\":{\"thz_enable\":%u,\"sense_enable\":%u,\"comm_enable\":%u,"
+               "\"traffic_enable\":%u,\"reacquire\":%u}}\n",
                input.slot_id, Fsm_StateName(output.previous_state), Fsm_StateName(output.state),
-               Fsm_ReasonName(output.reason), output.fault_mask);
+               Fsm_ReasonName(output.reason), output.fault_mask, output.recovery_action_mask,
+               output.mmwave.rf_enable, output.mmwave.sense_enable, output.mmwave.comm_enable,
+               Fsm_ScanModeName(output.mmwave.scan_mode),
+               output.gimbal.enable, output.gimbal.fine_tune_enable,
+               output.gimbal.target_azimuth_mdeg, output.gimbal.target_elevation_mdeg,
+               output.gimbal.angular_speed_mdeg_s,
+               output.thz.thz_enable, output.thz.sense_enable, output.thz.comm_enable,
+               output.thz.traffic_enable, output.thz.reacquire);
     }
     fclose(file);
     return 0;
